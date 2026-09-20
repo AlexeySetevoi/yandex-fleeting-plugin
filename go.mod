@@ -3,6 +3,7 @@ module github.com/AlexeySetevoi/yandex-fleeting-plugin
 go 1.26.8
 
 require (
+	github.com/BurntSushi/toml v1.6.0
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/yandex-cloud/go-genproto v0.122.0
 	github.com/yandex-cloud/go-sdk/services/compute v1.0.103

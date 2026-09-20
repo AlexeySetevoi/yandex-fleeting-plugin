@@ -1,6 +1,8 @@
 package yandex
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -30,6 +32,21 @@ const (
 
 // имя идёт и в имя инстанса, и в значение label
 var nameRegexp = regexp.MustCompile(`^[a-z][-a-z0-9]*$`)
+
+// UnmarshalJSON разбирает plugin_config строго. Библиотека fleeting делает
+// обычный json.Unmarshal, который молча пропускает незнакомые ключи: опечатка
+// в необязательном поле (preemtible, security_groups_ids) осталась бы
+// незамеченной и стоила бы денег или доступа. Лучше упасть на старте.
+func (g *InstanceGroup) UnmarshalJSON(data []byte) error {
+	type plain InstanceGroup
+
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode((*plain)(g)); err != nil {
+		return fmt.Errorf("invalid plugin config: %w", err)
+	}
+	return nil
+}
 
 func (g *InstanceGroup) validate() error {
 	var errs []error
