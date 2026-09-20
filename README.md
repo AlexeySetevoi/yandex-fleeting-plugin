@@ -317,45 +317,63 @@ yc vpc subnet update <подсеть> --route-table-id <route_table_id>
 ## Пример: Windows-раннер по WinRM
 
 Compute API не генерирует и не отдаёт пароль администратора, поэтому для WinRM обязателен
-`use_static_credentials = true` — без него плагин не стартует. Пароль должен оказаться в ВМ одним из двух способов:
-
-- зашит в ваш образ (вместе с включённым WinRM);
-- задаётся при первом запуске через `user_data` — если в образе есть агент, исполняющий user-data (cloudbase-init):
-
-```powershell
-#ps1
-net user Administrator "<пароль>"
-Enable-PSRemoting -Force
-Set-Item WSMan:\localhost\Service\Auth\Basic $true
-Set-Item WSMan:\localhost\Service\AllowUnencrypted $true
-netsh advfirewall firewall add rule name="WinRM" dir=in action=allow protocol=TCP localport=5985
-```
+`use_static_credentials = true` — без него плагин не стартует. Учётные данные должны быть в самом образе:
+собственный образ (Packer + QEMU) с запечённым паролем `Administrator`, включённым WinRM и HTTPS-слушателем.
 
 ```toml
+[[runners]]
+  name = "yandex-windows"
+  executor = "instance"     # джобы идут прямо в шелле ВМ, Docker на Windows не нужен
+  shell = "powershell"
+
+  [runners.autoscaler]
+    plugin = "fleeting-plugin-yandex"
+    capacity_per_instance = 1
+    max_use_count = 20
+    max_instances = 2
+    # WinRM отвечает раньше, чем образ реально готов: проверяем то, что нужно джобам
+    instance_ready_command = 'if not exist "C:\UE_5.8\Engine" exit 1'
+
     [runners.autoscaler.plugin_config]
-      name           = "ci-windows"
-      folder_id      = "b1g..."
-      service_account_key_file = "/etc/gitlab-runner/yc-key.json"
-      zone           = "ru-central1-a"
-      subnet_id      = "e9b..."
-      cores          = 8
-      memory_gb      = 16
-      image_id       = "fd8..."          # свой Windows-образ
-      disk_size_gb   = 100
-      nat            = true
-      user_data_file = "/etc/gitlab-runner/windows-user-data.ps1"
+      name               = "ci-windows"
+      folder_id          = "b1g..."
+      zone               = "ru-central1-a"
+      subnet_id          = "e9b..."
+      cores              = 8
+      memory_gb          = 16
+      image_id           = "fd8..."     # свой Windows-образ
+      disk_size_gb       = 120
+      security_group_ids = ["enp..."]   # 5986 только с адреса раннер-менеджера
 
     [runners.autoscaler.connector_config]
-      protocol = "winrm"
       username = "Administrator"
       password = "<пароль>"
+      protocol = "winrm+https"
       use_static_credentials = true
-      use_external_addr = true
+      timeout = "45m"
 ```
 
-Пароль в user-data виден всем, у кого есть доступ к metadata ВМ и к каталогу; WinRM по HTTP — только внутри
-доверенной сети или за группой безопасности, пускающей порт 5985 лишь с адреса раннер-менеджера. Windows-образов в
-маркетплейсе Yandex Cloud сейчас нет — нужен собственный образ с вашей лицензией.
+Схема проверена вживую под `gitlab-runner` 19.4: образ Windows Server 2022 (virtio-драйверы из `virtio-win`,
+сборка на `virtio-scsi`, BIOS/MBR) загрузился без доработок, PowerShell-джоба выполнилась, после `idle_time` ВМ
+удалена. Первая ВМ из свежего образа создаётся около 4 минут, доступ по WinRM появляется примерно через минуту
+после `RUNNING`.
+
+Что нужно знать:
+
+- **`winrm+https`, а не `winrm`.** Коннектор раннера ходит по NTLM без шифрования сообщений, поэтому по HTTP он
+  работает только с `AllowUnencrypted=true` на стороне Windows. По HTTPS сертификат не проверяется — подойдёт
+  самоподписанный.
+- **Импорт образа: qcow2 только со сжатием zlib.** Образ со сжатием zstd (`compression_type=zstd`) Compute отклоняет
+  за секунды с невнятной ошибкой `url source invalid`, хотя ссылка рабочая. Конвертация:
+  `qemu-img convert -O qcow2 -c -o compression_type=zlib in.qcow2 out.qcow2`. Дальше — загрузка в Object Storage,
+  подписанная ссылка и `yc compute image create --os-type windows --source-uri <ссылка>`.
+- **`user_data` для Windows работает, только если в образе есть агент, исполняющий user-data (cloudbase-init).**
+  В образе без него ключ игнорируется — пароль и WinRM должны быть настроены при сборке.
+- **Windows-образы из маркетплейса Yandex Cloud** (Windows Server 2016/2022/2025 от партнёров) существуют, но
+  создание ВМ из них требует проверки Microsoft SPLA на уровне облака: без подтверждённого почтового адреса и
+  флага от аккаунт-менеджера API отвечает `Product license prohibits usage of product(s)`. Плагин на этих образах
+  не проверялся. Лицензирование собственного образа — на вашей стороне.
+- Пароль лежит в `config.toml` открытым текстом: права `0600`, порт 5986 — только с адреса раннер-менеджера.
 
 ## Расписание: тёплая машина в рабочие часы
 
