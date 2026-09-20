@@ -11,9 +11,9 @@
 //	    -folder-id=b1g... -zone=ru-central1-a -subnet-id=e9b... \
 //	    -image-family=ubuntu-2404-lts -nat
 //
-// Проверка fallback по размещениям — первым идёт вариант заведомо без ресурсов:
+// Посмотреть реальный код ошибки (ВМ не создаётся) — заведомо невыполнимый запрос:
 //
-//	... -placements=<zone>:<subnet_id>:<platform_id>,ru-central1-a:e9b...:standard-v3
+//	... -cores=80 -memory-gb=80 -core-fraction=100
 //
 // Windows/WinRM (пароль уже задан в образе или через -user-data-file):
 //

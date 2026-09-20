@@ -173,7 +173,7 @@ func (g *InstanceGroup) Increase(ctx context.Context, delta int) (int, error) {
 				return nil
 			}
 
-			g.log.Info("instance created", "id", instance.ID, "name", instance.Name)
+			g.log.Info("instance created", "id", instance.ID, "instance_name", instance.Name)
 			succeeded++
 			return nil
 		})
