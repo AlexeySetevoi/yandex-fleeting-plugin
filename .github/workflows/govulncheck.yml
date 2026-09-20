@@ -1,0 +1,23 @@
+name: govulncheck
+
+# Отдельно от ci: уязвимость в зависимости без выпущенного исправления не должна
+# блокировать релизы, но должна быть видна. Раз в неделю — чтобы ловить новые
+# записи в базе и без пушей.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 5 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
+        with:
+          go-version-file: go.mod
+          go-package: ./...

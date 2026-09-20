@@ -475,7 +475,7 @@ func TestSDKCreateInstanceRequestFails(t *testing.T) {
 			if tt.sentinel != nil && !errors.Is(err, tt.sentinel) {
 				t.Fatalf("CreateInstance() = %v, want %v", err, tt.sentinel)
 			}
-			if errors.Is(err, ErrResourceExhausted) != (tt.sentinel == ErrResourceExhausted) {
+			if errors.Is(err, ErrResourceExhausted) != errors.Is(tt.sentinel, ErrResourceExhausted) {
 				t.Fatalf("CreateInstance() = %v: would trigger a placement fallback it should not", err)
 			}
 			if cloud.polls != 0 {

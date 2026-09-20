@@ -22,7 +22,8 @@ func (g *InstanceGroup) setupSSHKey() error {
 
 	var publicKey []byte
 
-	if !g.settings.UseStaticCredentials {
+	switch {
+	case !g.settings.UseStaticCredentials:
 		g.log.Info("generating ssh key")
 
 		pub, priv, err := generateSSHKeyPair()
@@ -32,7 +33,7 @@ func (g *InstanceGroup) setupSSHKey() error {
 
 		g.settings.Key = priv
 		publicKey = pub
-	} else if len(g.settings.Key) > 0 {
+	case len(g.settings.Key) > 0:
 		g.log.Info("using static ssh key")
 
 		pub, err := publicKeyFromPrivate(g.settings.Key)
@@ -41,7 +42,7 @@ func (g *InstanceGroup) setupSSHKey() error {
 		}
 
 		publicKey = pub
-	} else {
+	default:
 		// статический пароль или ключ, уже зашитый в образ
 		return nil
 	}

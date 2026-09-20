@@ -13,12 +13,14 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - name: fmt
-        run: test -z "$(gofmt -l .)"
+      - name: go.mod is tidy
+        run: go mod tidy -diff
+      - name: modules match go.sum
+        run: go mod verify
       - name: vet
         run: go vet ./...
       - name: test
@@ -26,76 +28,115 @@ jobs:
           go test ./... -count=1 -race -coverprofile=coverage.out
           go tool cover -func=coverage.out | tee -a "$GITHUB_STEP_SUMMARY"
 
-  build:
-    needs: test
+  lint:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        goos: [linux, darwin]
-        goarch: [amd64, arm64]
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - name: build
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
-          MODULE_PATH: github.com/AlexeySetevoi/yandex-fleeting-plugin
-          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
-        run: |
-          mkdir -p dist
-          go build -trimpath -ldflags "-s -w \
-            -X '${MODULE_PATH}.VERSION=${VERSION}' \
-            -X '${MODULE_PATH}.REVISION=${GITHUB_SHA::8}' \
-            -X '${MODULE_PATH}.REFERENCE=${GITHUB_REF_NAME}' \
-            -X '${MODULE_PATH}.BUILT=$(date -u +%Y-%m-%dT%H:%M:%SZ)'" \
-            -o "dist/fleeting-plugin-yandex-${GOOS}-${GOARCH}" \
-            ./cmd/fleeting-plugin-yandex
-      # deb/rpm только для linux; отдельным шагом без GOOS/GOARCH, иначе
-      # nfpm соберётся под целевую архитектуру и не запустится
-      - name: package
-        if: matrix.goos == 'linux'
-        env:
-          ARCH: ${{ matrix.goarch }}
-          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '0.0.0-dev' }}
-        run: |
-          mkdir -p pkg
-          cp "dist/fleeting-plugin-yandex-linux-${ARCH}" pkg/fleeting-plugin-yandex
-          for packager in deb rpm; do
-            go run github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.47.0 pkg --packager "$packager" --target dist/
-          done
-          ls -l dist/
-      - uses: actions/upload-artifact@v7
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          name: fleeting-plugin-yandex-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/
+          version: v2.13.2
+
+  # тот же GoReleaser, что и на релизе, но без публикации: конфиг релиза
+  # проверяется на каждом пуше, а не в момент выпуска версии
+  snapshot:
+    if: github.ref_type != 'tag'
+    needs: [test, lint]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: v2.18.2
+          args: release --snapshot --clean --skip=publish
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: snapshot
+          path: |
+            dist/SHA256SUMS
+            dist/*.deb
+            dist/*.rpm
+            dist/*.spdx.json
+            dist/plugin_*/fleeting-plugin-yandex
 
   release:
     if: github.ref_type == 'tag'
-    needs: build
+    needs: [test, lint]
     runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
       attestations: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: dist
-          merge-multiple: true
-      - name: checksums
-        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
-      # подпись происхождения (Sigstore, без своих ключей): проверяется
-      # через gh attestation verify
-      - uses: actions/attest@v4
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          subject-path: dist/*
-      # одной командой: с immutable releases после публикации файлы уже не
-      # добавить, gh сам создаёт черновик, грузит файлы и только потом публикует
-      - name: release
+          go-version-file: go.mod
+      - uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+
+      # сборка, deb/rpm, SBOM, SHA256SUMS и релиз-черновик со всеми файлами
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: v2.18.2
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      # Аттестации (Sigstore, без своих ключей), проверяются через
+      # gh attestation verify. В приватном репозитории личного аккаунта GitHub
+      # их не даёт, поэтому шаги работают только в публичном.
+      - name: attest provenance of every release file
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      # SBOM снят с бинаря; deb и rpm той же архитектуры содержат этот же бинарь
+      - name: split checksums per platform
+        if: ${{ !github.event.repository.private }}
+        run: |
+          grep -E '(-linux-amd64|_amd64\.deb|\.x86_64\.rpm)$' dist/SHA256SUMS > sums-linux-amd64
+          grep -E '(-linux-arm64|_arm64\.deb|\.aarch64\.rpm)$' dist/SHA256SUMS > sums-linux-arm64
+          grep -E -- '-darwin-amd64$' dist/SHA256SUMS > sums-darwin-amd64
+          grep -E -- '-darwin-arm64$' dist/SHA256SUMS > sums-darwin-arm64
+          wc -l sums-*
+      - name: attest sbom linux/amd64
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: sums-linux-amd64
+          sbom-path: dist/fleeting-plugin-yandex-linux-amd64.spdx.json
+      - name: attest sbom linux/arm64
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: sums-linux-arm64
+          sbom-path: dist/fleeting-plugin-yandex-linux-arm64.spdx.json
+      - name: attest sbom darwin/amd64
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: sums-darwin-amd64
+          sbom-path: dist/fleeting-plugin-yandex-darwin-amd64.spdx.json
+      - name: attest sbom darwin/arm64
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: sums-darwin-arm64
+          sbom-path: dist/fleeting-plugin-yandex-darwin-arm64.spdx.json
+
+      # публикация — последним шагом: после неё релиз неизменяемый
+      - name: publish release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "$GITHUB_REF_NAME" --generate-notes
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false

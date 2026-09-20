@@ -23,8 +23,8 @@ func TestMapError(t *testing.T) {
 	}
 
 	other := status.Error(codes.PermissionDenied, "denied")
-	if err := mapError(other); err != other {
-		t.Fatalf("mapError(PermissionDenied) = %v, want the error unchanged", err)
+	if err := mapError(other); errors.Is(err, ErrNotFound) || errors.Is(err, ErrResourceExhausted) || status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("mapError(PermissionDenied) = %v, want the error without a sentinel", err)
 	}
 }
 

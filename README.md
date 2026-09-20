@@ -1,5 +1,9 @@
 # fleeting-plugin-yandex
 
+> A [GitLab Runner fleeting](https://docs.gitlab.com/runner/fleet_scaling/fleeting/) plugin that autoscales CI
+> workers on [Yandex Compute Cloud](https://yandex.cloud/en/services/compute): Linux over SSH and Windows over WinRM,
+> placement fallback across zones/platforms, preemptible VMs, private networks. The documentation below is in Russian.
+
 [Fleeting plugin](https://docs.gitlab.com/runner/executors/docker_autoscaler/) для GitLab Runner (executor-ы
 `docker-autoscaler` и `instance`), который создаёт и удаляет виртуальные машины в
 [Yandex Compute Cloud](https://yandex.cloud/ru/services/compute) под нагрузку CI-джобов. Поддерживаются Linux (SSH)
@@ -87,17 +91,25 @@ chmod +x fleeting-plugin-yandex
 
 ### Проверка подлинности
 
-Ключей GPG у проекта нет — используется то, что даёт сам GitHub:
+Ключей GPG у проекта нет — используется то, что даёт сам GitHub (подписи Sigstore, привязанные к репозиторию,
+workflow, коммиту и тегу):
 
-- **аттестация происхождения** (artifact attestation, Sigstore): на каждый файл релиза — бинари, `deb`, `rpm`,
-  `SHA256SUMS` — workflow выпускает подпись, привязанную к репозиторию, workflow, коммиту и тегу;
-- **неизменяемые релизы**: тег и файлы после публикации подменить нельзя, GitHub сам выпускает аттестацию релиза;
-- `SHA256SUMS` — для проверки целостности без `gh`.
+- **аттестация происхождения** (build provenance) — на каждый файл релиза: бинари, `deb`, `rpm`, SBOM, `SHA256SUMS`;
+- **аттестация SBOM** — к каждому бинарю и пакету привязан SBOM (SPDX, снят с бинаря через syft); сами
+  `*.spdx.json` тоже лежат в релизе;
+- **неизменяемые релизы** — тег и файлы после публикации подменить нельзя, GitHub сам выпускает аттестацию релиза;
+- `SHA256SUMS` — для проверки целостности без `gh`;
+- сборка воспроизводима (`-trimpath`, время из коммита): пересборка того же тега даёт те же контрольные суммы
+  бинарей и пакетов.
 
 ```shell
-gh attestation verify fleeting-plugin-yandex_<версия>_amd64.deb -R AlexeySetevoi/yandex-fleeting-plugin
-gh release verify <версия> -R AlexeySetevoi/yandex-fleeting-plugin
-gh release verify-asset <версия> fleeting-plugin-yandex_<версия>_amd64.deb -R AlexeySetevoi/yandex-fleeting-plugin
+R=AlexeySetevoi/yandex-fleeting-plugin
+F=fleeting-plugin-yandex_<версия>_amd64.deb
+
+gh attestation verify $F -R $R                                                    # происхождение
+gh attestation verify $F -R $R --predicate-type https://spdx.dev/Document/v2.3    # SBOM
+gh release verify <версия> -R $R                                                  # релиз не подменён
+gh release verify-asset <версия> $F -R $R                                         # файл именно из этого релиза
 sha256sum -c SHA256SUMS --ignore-missing
 ```
 
@@ -289,7 +301,7 @@ Compute API не генерирует и не отдаёт пароль адми
 
 ```powershell
 #ps1
-net user Administrator "S3cret-Passw0rd"
+net user Administrator "<пароль>"
 Enable-PSRemoting -Force
 Set-Item WSMan:\localhost\Service\Auth\Basic $true
 Set-Item WSMan:\localhost\Service\AllowUnencrypted $true
@@ -313,7 +325,7 @@ netsh advfirewall firewall add rule name="WinRM" dir=in action=allow protocol=TC
     [runners.autoscaler.connector_config]
       protocol = "winrm"
       username = "Administrator"
-      password = "S3cret-Passw0rd"
+      password = "<пароль>"
       use_static_credentials = true
       use_external_addr = true
 ```
@@ -348,13 +360,17 @@ netsh advfirewall firewall add rule name="WinRM" dir=in action=allow protocol=TC
 
 ## CI/CD
 
-`.github/workflows/ci.yml`: `fmt`/`vet`/`test` (с `-race`, покрытие — в summary джобы) на каждый пуш в `main` и на
-pull request, кросс-сборка (`linux/darwin` × `amd64/arm64`) и `deb`/`rpm` для Linux через
-[nfpm](https://nfpm.goreleaser.com/) (`nfpm.yaml`), на тег `X.Y.Z` — GitHub Release с бинарями и пакетами.
+- `.github/workflows/ci.yml` — на каждый пуш в `main` и pull request: `go mod tidy -diff`, `go mod verify`, `vet`,
+  тесты с `-race` (покрытие — в summary джобы), `golangci-lint` (`.golangci.yml`) и пробная сборка релиза
+  [GoReleaser](https://goreleaser.com/)-ом без публикации — конфиг релиза проверяется постоянно, а не в момент выпуска.
+- На тег `X.Y.Z` — релиз: GoReleaser (`.goreleaser.yaml`) собирает бинари `linux/darwin` × `amd64/arm64`, `deb`/`rpm`,
+  SBOM и `SHA256SUMS` и создаёт релиз-черновик; затем выпускаются аттестации, и последним шагом релиз публикуется.
+- `.github/workflows/govulncheck.yml` — `govulncheck` на пуш и раз в неделю. Отдельно от `ci`, чтобы уязвимость в
+  зависимости, для которой ещё нет исправления, была видна, но не блокировала релизы.
+- `.github/dependabot.yml` — еженедельные обновления Go-модулей и экшенов. Экшены закреплены по SHA коммита.
 
 Выпуск версии: `git tag 1.0.0 && git push origin 1.0.0`. Создавать релиз руками в интерфейсе не нужно и нельзя:
-релизы неизменяемые (immutable releases), workflow публикует релиз сразу со всеми файлами, а к уже опубликованному
-файлы не добавить.
+релизы неизменяемые (immutable releases), к опубликованному релизу файлы не добавить.
 
 ## Suspend/Resume
 
@@ -366,6 +382,8 @@ pull request, кросс-сборка (`linux/darwin` × `amd64/arm64`) и `deb`
 go build ./...
 go vet ./...
 go test ./... -count=1 -race
+golangci-lint run ./...
+goreleaser release --snapshot --clean --skip=publish   # локальная пробная сборка релиза, нужен syft
 ```
 
 Тесты работают без доступа к облаку:
@@ -403,3 +421,7 @@ YC_SERVICE_ACCOUNT_KEY_FILE=yc-key.json go run ./cmd/smoketest \
 ```
 
 Остальные флаги — `go run ./cmd/smoketest -h`.
+
+## Лицензия
+
+[MIT](LICENSE).

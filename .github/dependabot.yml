@@ -1,0 +1,20 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      go-modules:
+        patterns: ["*"]
+    ignore:
+      # в ветке 1.84 нет исправления GO-2026-6443 (есть в 1.83.2 и будет в 1.85)
+      - dependency-name: google.golang.org/grpc
+        versions: ["1.84.x"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

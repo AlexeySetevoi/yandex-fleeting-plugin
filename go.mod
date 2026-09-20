@@ -1,6 +1,6 @@
 module github.com/AlexeySetevoi/yandex-fleeting-plugin
 
-go 1.26.5
+go 1.26.8
 
 require (
 	github.com/hashicorp/go-hclog v1.6.3
@@ -8,14 +8,14 @@ require (
 	github.com/yandex-cloud/go-sdk/services/compute v1.0.103
 	github.com/yandex-cloud/go-sdk/v2 v2.177.0
 	gitlab.com/gitlab-org/fleeting/fleeting v0.0.0-20260728133024-9832b1044ee2
-	golang.org/x/crypto v0.54.0
+	golang.org/x/crypto v0.57.0
 	golang.org/x/sync v0.23.0
-	google.golang.org/grpc v1.82.1
+	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.11
 )
 
 require (
-	github.com/Azure/go-ntlmssp v0.1.0 // indirect
+	github.com/Azure/go-ntlmssp v0.1.1 // indirect
 	github.com/ChrisTrenkamp/goxpath v0.0.0-20210404020558-97928f7e12b6 // indirect
 	github.com/bodgit/ntlmssp v0.0.0-20240506230425-31973bb52d9b // indirect
 	github.com/bodgit/windows v1.0.1 // indirect
@@ -46,11 +46,11 @@ require (
 	github.com/tidwall/transform v0.0.0-20201103190739-32f242e2dbde // indirect
 	go.uber.org/multierr v1.10.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
-	golang.org/x/mod v0.38.0 // indirect
-	golang.org/x/net v0.56.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.40.0 // indirect
-	google.golang.org/genproto/googleapis/api v0.0.0-20260414002931-afd174a4e478 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
+	golang.org/x/mod v0.41.0 // indirect
+	golang.org/x/net v0.59.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
+	google.golang.org/genproto/googleapis/api v0.0.0-20260706201446-f0a921348800 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260706201446-f0a921348800 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )

@@ -42,6 +42,12 @@ import (
 const accessCheckAttemptTimeout = 20 * time.Second
 
 func main() {
+	os.Exit(run())
+}
+
+// run — отдельно от main, чтобы defer-ы (удаление созданной ВМ) отработали до
+// выхода из процесса.
+func run() int {
 	name := flag.String("name", "smoketest", "instance group name / instance name prefix")
 	folderID := flag.String("folder-id", "", "Yandex Cloud folder id (required)")
 	keyFile := flag.String("key-file", "", "service account authorized key file (or YC_SERVICE_ACCOUNT_KEY_FILE)")
@@ -76,7 +82,7 @@ func main() {
 	if *folderID == "" {
 		fmt.Fprintln(os.Stderr, "usage: smoketest -folder-id=<id> (-zone=<zone> -subnet-id=<id> | -placements=...) (-image-id=<id> | -image-family=<family>) ...")
 		flag.PrintDefaults()
-		os.Exit(2)
+		return 2
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -123,7 +129,8 @@ func main() {
 
 	info, err := g.Init(ctx, logger, settings)
 	if err != nil {
-		log.Fatalf("Init: %v", err)
+		logger.Error("init failed", "error", err)
+		return 1
 	}
 	logger.Info("initialized", "provider_id", info.ID, "max_size", info.MaxSize)
 
@@ -132,7 +139,8 @@ func main() {
 		logger.Error("increase reported an error", "error", err)
 	}
 	if succeeded != 1 {
-		log.Fatalf("Increase: succeeded=%d, want 1", succeeded)
+		logger.Error("increase did not create the instance", "succeeded", succeeded)
+		return 1
 	}
 
 	// дальше инстанс существует и должен быть убран при любом исходе
@@ -160,20 +168,20 @@ func main() {
 	instanceID, err = waitUntilRunning(ctx, logger, g, *pollInterval, *readyTimeout)
 	if err != nil {
 		logger.Error("waiting for instance failed", "error", err)
-		return
+		return 1
 	}
 
 	logger.Info("instance is running, letting it settle before checking access", "duration", settle.String())
 	select {
 	case <-ctx.Done():
-		return
+		return 1
 	case <-time.After(*settle):
 	}
 
 	connectInfo, err := g.ConnectInfo(ctx, instanceID)
 	if err != nil {
 		logger.Error("connect info failed", "error", err)
-		return
+		return 1
 	}
 	logger.Info("connect info",
 		"external_addr", connectInfo.ExternalAddr,
@@ -186,9 +194,11 @@ func main() {
 
 	if err := checkAccess(ctx, logger, connectInfo, *accessTimeout, *accessRetryInterval, *checkCmd, *useExternalAddr); err != nil {
 		logger.Error("ACCESS CHECK FAILED", "error", err)
-	} else {
-		logger.Info("ACCESS CHECK PASSED")
+		return 1
 	}
+
+	logger.Info("ACCESS CHECK PASSED")
+	return 0
 }
 
 func parsePlacements(value string) []yandex.Placement {

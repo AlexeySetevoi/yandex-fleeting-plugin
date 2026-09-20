@@ -1,0 +1,67 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+project_name: fleeting-plugin-yandex
+
+before:
+  hooks:
+    - go mod verify
+
+builds:
+  - id: plugin
+    main: ./cmd/fleeting-plugin-yandex
+    binary: fleeting-plugin-yandex
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    # воспроизводимая сборка: без путей сборщика и с временем коммита
+    flags:
+      - -trimpath
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    ldflags:
+      - -s -w
+      - -X github.com/AlexeySetevoi/yandex-fleeting-plugin.VERSION={{ .Version }}
+      - -X github.com/AlexeySetevoi/yandex-fleeting-plugin.REVISION={{ .ShortCommit }}
+      - -X github.com/AlexeySetevoi/yandex-fleeting-plugin.REFERENCE={{ .Tag }}
+      - -X github.com/AlexeySetevoi/yandex-fleeting-plugin.BUILT={{ .CommitDate }}
+
+# бинарь кладётся в релиз как есть, без архива: раннер-хосту нужен один файл
+archives:
+  - formats: [binary]
+    name_template: "{{ .Binary }}-{{ .Os }}-{{ .Arch }}"
+
+nfpms:
+  - id: packages
+    package_name: fleeting-plugin-yandex
+    formats: [deb, rpm]
+    file_name_template: "{{ .ConventionalFileName }}"
+    # время файлов внутри пакета — время коммита, иначе пакет не воспроизводим
+    mtime: "{{ .CommitDate }}"
+    maintainer: Alexey <alexeysetevoi@gmail.com>
+    description: GitLab Runner fleeting plugin for Yandex Compute Cloud
+    homepage: https://github.com/AlexeySetevoi/yandex-fleeting-plugin
+    license: MIT
+    # в /usr/bin раннер находит плагин по имени: plugin = "fleeting-plugin-yandex"
+    bindir: /usr/bin
+
+checksum:
+  name_template: SHA256SUMS
+
+# SBOM на каждый бинарь (syft, SPDX); deb/rpm содержат тот же бинарь
+sboms:
+  - id: binaries
+    artifacts: binary
+    documents:
+      - "{{ .Binary }}-{{ .Os }}-{{ .Arch }}.spdx.json"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-dev"
+
+changelog:
+  use: github-native
+
+release:
+  # черновик: workflow сначала выпускает аттестации и только потом публикует —
+  # опубликованный релиз неизменяемый, файлы к нему уже не добавить
+  draft: true
