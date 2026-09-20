@@ -54,6 +54,20 @@ jobs:
             -X '${MODULE_PATH}.BUILT=$(date -u +%Y-%m-%dT%H:%M:%SZ)'" \
             -o "dist/fleeting-plugin-yandex-${GOOS}-${GOARCH}" \
             ./cmd/fleeting-plugin-yandex
+      # deb/rpm только для linux; отдельным шагом без GOOS/GOARCH, иначе
+      # nfpm соберётся под целевую архитектуру и не запустится
+      - name: package
+        if: matrix.goos == 'linux'
+        env:
+          ARCH: ${{ matrix.goarch }}
+          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '0.0.0-dev' }}
+        run: |
+          mkdir -p pkg
+          cp "dist/fleeting-plugin-yandex-linux-${ARCH}" pkg/fleeting-plugin-yandex
+          for packager in deb rpm; do
+            go run github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.47.0 pkg --packager "$packager" --target dist/
+          done
+          ls -l dist/
       - uses: actions/upload-artifact@v7
         with:
           name: fleeting-plugin-yandex-${{ matrix.goos }}-${{ matrix.goarch }}
@@ -65,17 +79,23 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
+      - name: checksums
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      # подпись происхождения (Sigstore, без своих ключей): проверяется
+      # через gh attestation verify
+      - uses: actions/attest@v4
+        with:
+          subject-path: dist/*
+      # одной командой: с immutable releases после публикации файлы уже не
+      # добавить, gh сам создаёт черновик, грузит файлы и только потом публикует
       - name: release
         env:
           GH_TOKEN: ${{ github.token }}
-        # релиз мог быть создан руками в интерфейсе вместе с тегом
-        run: |
-          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"; then
-            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
-          fi
-          gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag --title "$GITHUB_REF_NAME" --generate-notes

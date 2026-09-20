@@ -58,8 +58,26 @@ go build -o fleeting-plugin-yandex ./cmd/fleeting-plugin-yandex
 
 ## Деплой
 
-На каждый тег `X.Y.Z` GitHub Actions собирает бинари под `linux`/`darwin` × `amd64`/`arm64` и прикладывает их к
+На каждый тег `X.Y.Z` GitHub Actions собирает бинари под `linux`/`darwin` × `amd64`/`arm64`, а для Linux ещё и
+пакеты `deb`/`rpm`, и прикладывает всё к
 [релизу](https://github.com/AlexeySetevoi/yandex-fleeting-plugin/releases).
+
+Пакет кладёт бинарь в `/usr/bin/fleeting-plugin-yandex`, поэтому в конфиге раннера достаточно имени:
+`plugin = "fleeting-plugin-yandex"`.
+
+```shell
+# Debian/Ubuntu
+curl -fsSLO "https://github.com/AlexeySetevoi/yandex-fleeting-plugin/releases/download/<версия>/fleeting-plugin-yandex_<версия>_amd64.deb"
+sudo dpkg -i fleeting-plugin-yandex_<версия>_amd64.deb
+
+# RHEL/Rocky/Alma
+sudo rpm -Uvh "https://github.com/AlexeySetevoi/yandex-fleeting-plugin/releases/download/<версия>/fleeting-plugin-yandex-<версия>-1.x86_64.rpm"
+```
+
+Для arm64 — `_arm64.deb` и `.aarch64.rpm`. Пока репозиторий приватный, скачивание требует токен
+(`gh release download <версия> -p '*.deb'`).
+
+Либо просто бинарь:
 
 ```shell
 curl -fsSL -o fleeting-plugin-yandex \
@@ -67,9 +85,30 @@ curl -fsSL -o fleeting-plugin-yandex \
 chmod +x fleeting-plugin-yandex
 ```
 
-1. Положить бинарь на хост, где крутится `gitlab-runner` (например, `/etc/gitlab-runner/plugins/fleeting-plugin-yandex`,
-   `root:root`, `0755`).
-2. Указать этот путь в `plugin` секции `[runners.autoscaler]`.
+### Проверка подлинности
+
+Ключей GPG у проекта нет — используется то, что даёт сам GitHub:
+
+- **аттестация происхождения** (artifact attestation, Sigstore): на каждый файл релиза — бинари, `deb`, `rpm`,
+  `SHA256SUMS` — workflow выпускает подпись, привязанную к репозиторию, workflow, коммиту и тегу;
+- **неизменяемые релизы**: тег и файлы после публикации подменить нельзя, GitHub сам выпускает аттестацию релиза;
+- `SHA256SUMS` — для проверки целостности без `gh`.
+
+```shell
+gh attestation verify fleeting-plugin-yandex_<версия>_amd64.deb -R AlexeySetevoi/yandex-fleeting-plugin
+gh release verify <версия> -R AlexeySetevoi/yandex-fleeting-plugin
+gh release verify-asset <версия> fleeting-plugin-yandex_<версия>_amd64.deb -R AlexeySetevoi/yandex-fleeting-plugin
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+Нужен свежий `gh` с [cli.github.com](https://cli.github.com/): в 2.46 из репозитория Ubuntu команд `attestation` и
+`release verify` ещё нет.
+
+Это не GPG-подпись внутри пакета: `rpm -K`, `dnf` и `apt` её не видят, проверка — только через `gh`.
+
+1. Поставить пакет либо положить бинарь на хост, где крутится `gitlab-runner` (например,
+   `/etc/gitlab-runner/plugins/fleeting-plugin-yandex`, `root:root`, `0755`).
+2. Указать в `plugin` секции `[runners.autoscaler]` имя (для пакета) или полный путь (для бинаря).
 3. `systemctl restart gitlab-runner` — новый бинарь плагина подхватывается только при рестарте раннера. Правки
    самого `config.toml` раннер перечитывает сам.
 
@@ -310,10 +349,12 @@ netsh advfirewall firewall add rule name="WinRM" dir=in action=allow protocol=TC
 ## CI/CD
 
 `.github/workflows/ci.yml`: `fmt`/`vet`/`test` (с `-race`, покрытие — в summary джобы) на каждый пуш в `main` и на
-pull request, кросс-сборка (`linux/darwin` × `amd64/arm64`), на тег `X.Y.Z` — GitHub Release с бинарями.
+pull request, кросс-сборка (`linux/darwin` × `amd64/arm64`) и `deb`/`rpm` для Linux через
+[nfpm](https://nfpm.goreleaser.com/) (`nfpm.yaml`), на тег `X.Y.Z` — GitHub Release с бинарями и пакетами.
 
-Выпуск версии: `git tag 1.0.0 && git push origin 1.0.0`, либо в интерфейсе — Releases → Draft a new release →
-Choose a tag → новый тег `1.0.0` на `main` → Publish. Workflow создаст релиз, если его ещё нет, и приложит бинари.
+Выпуск версии: `git tag 1.0.0 && git push origin 1.0.0`. Создавать релиз руками в интерфейсе не нужно и нельзя:
+релизы неизменяемые (immutable releases), workflow публикует релиз сразу со всеми файлами, а к уже опубликованному
+файлы не добавить.
 
 ## Suspend/Resume
 
