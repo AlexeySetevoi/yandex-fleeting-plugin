@@ -1,0 +1,81 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["[0-9]+.[0-9]+.[0-9]+"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: fmt
+        run: test -z "$(gofmt -l .)"
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: |
+          go test ./... -count=1 -race -coverprofile=coverage.out
+          go tool cover -func=coverage.out | tee -a "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, darwin]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+          MODULE_PATH: github.com/AlexeySetevoi/yandex-fleeting-plugin
+          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w \
+            -X '${MODULE_PATH}.VERSION=${VERSION}' \
+            -X '${MODULE_PATH}.REVISION=${GITHUB_SHA::8}' \
+            -X '${MODULE_PATH}.REFERENCE=${GITHUB_REF_NAME}' \
+            -X '${MODULE_PATH}.BUILT=$(date -u +%Y-%m-%dT%H:%M:%SZ)'" \
+            -o "dist/fleeting-plugin-yandex-${GOOS}-${GOARCH}" \
+            ./cmd/fleeting-plugin-yandex
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fleeting-plugin-yandex-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # релиз мог быть создан руками в интерфейсе вместе с тегом
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"; then
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+          fi
+          gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber

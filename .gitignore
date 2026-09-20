@@ -1,0 +1,11 @@
+/.yckey*
+/*key*.json
+/fleeting-plugin-yandex
+/smoketest
+/dist/
+*.test
+
+/.idea/
+/.claude/
+/.claude-flow/
+/coverage.out
