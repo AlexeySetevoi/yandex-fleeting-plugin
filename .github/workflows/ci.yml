@@ -13,8 +13,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: fmt
@@ -34,8 +34,8 @@ jobs:
         goos: [linux, darwin]
         goarch: [amd64, arm64]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
       - name: build
@@ -54,7 +54,7 @@ jobs:
             -X '${MODULE_PATH}.BUILT=$(date -u +%Y-%m-%dT%H:%M:%SZ)'" \
             -o "dist/fleeting-plugin-yandex-${GOOS}-${GOARCH}" \
             ./cmd/fleeting-plugin-yandex
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: fleeting-plugin-yandex-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/
@@ -66,7 +66,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
