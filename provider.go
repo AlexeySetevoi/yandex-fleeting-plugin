@@ -122,8 +122,10 @@ func (g *InstanceGroup) Init(ctx context.Context, log hclog.Logger, settings pro
 	}
 
 	return provider.ProviderInfo{
-		ID:      path.Join("yandex", g.FolderID, g.Name),
-		MaxSize: math.MaxInt,
+		ID:        path.Join("yandex", g.FolderID, g.Name),
+		MaxSize:   math.MaxInt,
+		Version:   Version.String(),
+		BuildInfo: Version.BuildInfo(),
 	}, nil
 }
 

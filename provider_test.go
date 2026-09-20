@@ -136,6 +136,10 @@ func TestInitProviderInfo(t *testing.T) {
 	if info.ID != "yandex/folder-1/runner" {
 		t.Fatalf("ProviderInfo.ID = %q", info.ID)
 	}
+	// раннер пишет их в лог при старте — по ним видно, какая сборка плагина стоит
+	if info.Version == "" || info.BuildInfo == "" {
+		t.Fatalf("ProviderInfo version = %q, build info = %q, want both set", info.Version, info.BuildInfo)
+	}
 }
 
 func TestUpdateFiltersByLabel(t *testing.T) {
