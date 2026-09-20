@@ -44,6 +44,9 @@ nfpms:
     license: MIT
     # в /usr/bin раннер находит плагин по имени: plugin = "fleeting-plugin-yandex"
     bindir: /usr/bin
+    rpm:
+      # иначе в заголовок rpm попадает имя машины сборки и пакет не воспроизводим
+      buildhost: github-actions
 
 checksum:
   name_template: SHA256SUMS

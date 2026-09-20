@@ -101,6 +101,13 @@ jobs:
         with:
           subject-checksums: dist/SHA256SUMS
 
+      # сам SHA256SUMS в себе не перечислен — подписываем отдельно
+      - name: attest provenance of SHA256SUMS
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/SHA256SUMS
+
       # SBOM снят с бинаря; deb и rpm той же архитектуры содержат этот же бинарь
       - name: split checksums per platform
         if: ${{ !github.event.repository.private }}

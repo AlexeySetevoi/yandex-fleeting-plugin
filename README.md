@@ -99,8 +99,17 @@ workflow, коммиту и тегу):
   `*.spdx.json` тоже лежат в релизе;
 - **неизменяемые релизы** — тег и файлы после публикации подменить нельзя, GitHub сам выпускает аттестацию релиза;
 - `SHA256SUMS` — для проверки целостности без `gh`;
-- сборка воспроизводима (`-trimpath`, время из коммита): пересборка того же тега даёт те же контрольные суммы
-  бинарей и пакетов.
+- сборка воспроизводима (`-trimpath`, время из коммита, фиксированный `buildhost` в rpm): пересборка тега на
+  свежем клоне даёт те же контрольные суммы бинарей и пакетов, что в релизе. SBOM-файлы не совпадут — в них время
+  генерации.
+
+Проверить воспроизводимость самому:
+
+```shell
+git clone --branch <версия> https://github.com/AlexeySetevoi/yandex-fleeting-plugin.git && cd yandex-fleeting-plugin
+GITHUB_TOKEN=$(gh auth token) goreleaser release --clean --skip=publish   # токен нужен только для текста changelog
+grep -v spdx.json dist/SHA256SUMS | sort   # сравнить с SHA256SUMS из релиза
+```
 
 ```shell
 R=AlexeySetevoi/yandex-fleeting-plugin
