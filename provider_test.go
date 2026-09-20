@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/go-hclog"
 
@@ -15,13 +16,17 @@ import (
 	"github.com/AlexeySetevoi/yandex-fleeting-plugin/internal/yandexapi"
 )
 
-// fakeCompute — yandexapi.Compute в памяти. create решает судьбу каждого
-// запроса; все запросы на создание и удаление записываются.
+// fakeCompute — yandexapi.Compute в памяти. create решает судьбу запроса сразу
+// (квота, права), opErr — судьбу уже принятой операции (нехватка ресурсов
+// зоны); пока hold не закрыт, операции не завершаются. Все запросы на создание
+// и удаление записываются.
 type fakeCompute struct {
 	mu sync.Mutex
 
 	instances []yandexapi.Instance
 	create    func(req yandexapi.CreateInstanceRequest) error
+	opErr     func(req yandexapi.CreateInstanceRequest) error
+	hold      chan struct{}
 	deleteErr map[string]error
 	listErr   error
 	images    map[string]string
@@ -29,6 +34,31 @@ type fakeCompute struct {
 	created []yandexapi.CreateInstanceRequest
 	deleted []string
 	closed  bool
+}
+
+type fakeOperation struct {
+	instance yandexapi.Instance
+	err      error
+	hold     chan struct{}
+}
+
+func (o *fakeOperation) InstanceID() string { return o.instance.ID }
+
+func (o *fakeOperation) Wait(ctx context.Context) (*yandexapi.Instance, error) {
+	if o.hold != nil {
+		select {
+		case <-o.hold:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if o.err != nil {
+		return nil, o.err
+	}
+
+	instance := o.instance
+	instance.Status = yandexapi.StatusRunning
+	return &instance, nil
 }
 
 func (f *fakeCompute) ListInstances(_ context.Context, _ string) ([]yandexapi.Instance, error) {
@@ -48,7 +78,7 @@ func (f *fakeCompute) GetInstance(_ context.Context, id string) (*yandexapi.Inst
 	return nil, fmt.Errorf("%w: instance %s", yandexapi.ErrNotFound, id)
 }
 
-func (f *fakeCompute) CreateInstance(_ context.Context, req yandexapi.CreateInstanceRequest) (*yandexapi.Instance, error) {
+func (f *fakeCompute) CreateInstance(_ context.Context, req yandexapi.CreateInstanceRequest) (yandexapi.CreateOperation, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -59,14 +89,20 @@ func (f *fakeCompute) CreateInstance(_ context.Context, req yandexapi.CreateInst
 		}
 	}
 
+	// как в облаке: принятый запрос сразу даёт инстанс в PROVISIONING
 	instance := yandexapi.Instance{
 		ID:     fmt.Sprintf("id-%d", len(f.created)),
 		Name:   req.Name,
-		Status: yandexapi.StatusRunning,
+		Status: yandexapi.StatusProvisioning,
 		Labels: req.Labels,
 	}
 	f.instances = append(f.instances, instance)
-	return &instance, nil
+
+	op := &fakeOperation{instance: instance, hold: f.hold}
+	if f.opErr != nil {
+		op.err = f.opErr(req)
+	}
+	return op, nil
 }
 
 func (f *fakeCompute) DeleteInstance(_ context.Context, id string) error {
@@ -120,6 +156,8 @@ func initGroup(t *testing.T, g *InstanceGroup, fake *fakeCompute, settings provi
 	if _, err := g.Init(context.Background(), hclog.NewNullLogger(), settings); err != nil {
 		t.Fatalf("Init() = %v", err)
 	}
+	// гасит фоновые горутины watch, чтобы они не переживали тест
+	t.Cleanup(func() { _ = g.Shutdown(context.Background()) })
 }
 
 func TestInitProviderInfo(t *testing.T) {
@@ -544,5 +582,176 @@ func TestRandomSuffix(t *testing.T) {
 	a, b := randomSuffix(), randomSuffix()
 	if len(a) != 8 || a == b {
 		t.Fatalf("randomSuffix() = %q, %q", a, b)
+	}
+}
+
+// Цикл раннера однопоточный: пока Increase не вернулся, не идут ни Update, ни
+// удаление. Поэтому он обязан вернуться, не дожидаясь операций.
+func TestIncreaseDoesNotWaitForOperations(t *testing.T) {
+	fake := &fakeCompute{hold: make(chan struct{})}
+	g := validGroup()
+	initGroup(t, g, fake, provider.Settings{})
+
+	type result struct {
+		succeeded int
+		err       error
+	}
+	done := make(chan result, 1)
+	go func() {
+		succeeded, err := g.Increase(context.Background(), 3)
+		done <- result{succeeded, err}
+	}()
+
+	select {
+	case r := <-done:
+		if r.err != nil || r.succeeded != 3 {
+			t.Fatalf("Increase() = %d, %v", r.succeeded, r.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Increase() is blocked on unfinished create operations")
+	}
+
+	// принятые инстансы уже видны раннеру как creating
+	creating := 0
+	if err := g.Update(context.Background(), func(_ string, state provider.State) {
+		if state == provider.StateCreating {
+			creating++
+		}
+	}); err != nil || creating != 3 {
+		t.Fatalf("Update() reported %d creating instances, err %v, want 3", creating, err)
+	}
+
+	close(fake.hold)
+	g.watchers.Wait()
+}
+
+func asyncPlacementsGroup() *InstanceGroup {
+	g := validGroup()
+	g.Zone, g.SubnetID = "", ""
+	g.Placements = []Placement{
+		{Zone: "ru-central1-a", SubnetID: "subnet-a"},
+		{Zone: "ru-central1-b", SubnetID: "subnet-b"},
+	}
+	return g
+}
+
+// Нехватка ресурсов зоны приходит уже после того, как запрос принят. Increase
+// к этому моменту вернулся, поэтому fallback срабатывает на следующем запросе:
+// размещение уходит в конец очереди, а через placementCooldown возвращается.
+func TestAsyncExhaustionMovesPlacementToTheEnd(t *testing.T) {
+	exhausted := true
+	fake := &fakeCompute{}
+	fake.opErr = func(req yandexapi.CreateInstanceRequest) error {
+		if exhausted && req.Zone == "ru-central1-a" {
+			return fmt.Errorf("%w: not enough resources in zone", yandexapi.ErrResourceExhausted)
+		}
+		return nil
+	}
+
+	now := time.Date(2026, 9, 20, 12, 0, 0, 0, time.UTC)
+	g := asyncPlacementsGroup()
+	g.now = func() time.Time { return now }
+	initGroup(t, g, fake, provider.Settings{})
+
+	increase := func() string {
+		t.Helper()
+		succeeded, err := g.Increase(context.Background(), 1)
+		if err != nil || succeeded != 1 {
+			t.Fatalf("Increase() = %d, %v", succeeded, err)
+		}
+		g.watchers.Wait()
+		return fake.created[len(fake.created)-1].Zone
+	}
+
+	if zone := increase(); zone != "ru-central1-a" {
+		t.Fatalf("first request went to %s, want the first placement", zone)
+	}
+	if zone := increase(); zone != "ru-central1-b" {
+		t.Fatalf("request after the async failure went to %s, want the next placement", zone)
+	}
+
+	exhausted = false
+	now = now.Add(placementCooldown - time.Second)
+	if zone := increase(); zone != "ru-central1-b" {
+		t.Fatalf("request within the cooldown went to %s", zone)
+	}
+
+	now = now.Add(2 * time.Second)
+	if zone := increase(); zone != "ru-central1-a" {
+		t.Fatalf("request after the cooldown went to %s, want the first placement again", zone)
+	}
+}
+
+// Любая другая ошибка операции от смены зоны не лечится: порядок не меняется.
+func TestAsyncOtherErrorKeepsPlacementOrder(t *testing.T) {
+	fake := &fakeCompute{opErr: func(yandexapi.CreateInstanceRequest) error {
+		return errors.New("internal error")
+	}}
+	g := asyncPlacementsGroup()
+	initGroup(t, g, fake, provider.Settings{})
+
+	for range 2 {
+		if succeeded, err := g.Increase(context.Background(), 1); err != nil || succeeded != 1 {
+			t.Fatalf("Increase() = %d, %v", succeeded, err)
+		}
+		g.watchers.Wait()
+	}
+
+	for i, req := range fake.created {
+		if req.Zone != "ru-central1-a" {
+			t.Fatalf("request #%d went to %s, want the first placement", i+1, req.Zone)
+		}
+	}
+}
+
+// Размещения в конце очереди не выключены: если ресурсы кончились везде,
+// пробуем все в порядке из конфига, а не отказываем раннеру без попытки.
+func TestAllPlacementsExhaustedAreStillTried(t *testing.T) {
+	fake := &fakeCompute{opErr: func(yandexapi.CreateInstanceRequest) error {
+		return fmt.Errorf("%w: not enough resources", yandexapi.ErrResourceExhausted)
+	}}
+	g := asyncPlacementsGroup()
+	initGroup(t, g, fake, provider.Settings{})
+
+	var zones []string
+	for range 3 {
+		if succeeded, err := g.Increase(context.Background(), 1); err != nil || succeeded != 1 {
+			t.Fatalf("Increase() = %d, %v", succeeded, err)
+		}
+		g.watchers.Wait()
+		zones = append(zones, fake.created[len(fake.created)-1].Zone)
+	}
+
+	want := []string{"ru-central1-a", "ru-central1-b", "ru-central1-a"}
+	if strings.Join(zones, ",") != strings.Join(want, ",") {
+		t.Fatalf("zones tried = %v, want %v", zones, want)
+	}
+}
+
+// Остановка плагина не должна висеть на операциях, которые ещё идут.
+func TestShutdownDoesNotWaitForOperations(t *testing.T) {
+	fake := &fakeCompute{hold: make(chan struct{})}
+	g := validGroup()
+	initGroup(t, g, fake, provider.Settings{})
+
+	if succeeded, err := g.Increase(context.Background(), 2); err != nil || succeeded != 2 {
+		t.Fatalf("Increase() = %d, %v", succeeded, err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- g.Shutdown(context.Background()) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Shutdown() = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown() is blocked on unfinished create operations")
+	}
+
+	// отменённое ожидание — не отказ зоны
+	if got := g.orderedPlacements(); len(got) != 1 || len(g.exhaustedUntil) != 0 {
+		t.Fatalf("placements after shutdown = %v, exhausted = %v", got, g.exhaustedUntil)
 	}
 }

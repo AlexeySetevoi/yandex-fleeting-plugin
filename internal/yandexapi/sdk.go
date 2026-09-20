@@ -90,7 +90,7 @@ func (c *sdkCompute) GetInstance(ctx context.Context, id string) (*Instance, err
 	return &result, nil
 }
 
-func (c *sdkCompute) CreateInstance(ctx context.Context, req CreateInstanceRequest) (*Instance, error) {
+func (c *sdkCompute) CreateInstance(ctx context.Context, req CreateInstanceRequest) (CreateOperation, error) {
 	address := &compute.PrimaryAddressSpec{}
 	if req.NAT {
 		address.OneToOneNatSpec = &compute.OneToOneNatSpec{IpVersion: compute.IpVersion_IPV4}
@@ -131,7 +131,20 @@ func (c *sdkCompute) CreateInstance(ctx context.Context, req CreateInstanceReque
 		return nil, mapError(err)
 	}
 
-	instance, err := op.WaitInterval(ctx, c.pollInterval)
+	return &sdkCreateOperation{op: op, pollInterval: c.pollInterval}, nil
+}
+
+type sdkCreateOperation struct {
+	op           *computesdk.InstanceCreateOperation
+	pollInterval sdkop.PollIntervalFunc
+}
+
+func (o *sdkCreateOperation) InstanceID() string {
+	return o.op.Metadata().GetInstanceId()
+}
+
+func (o *sdkCreateOperation) Wait(ctx context.Context) (*Instance, error) {
+	instance, err := o.op.WaitInterval(ctx, o.pollInterval)
 	if err != nil {
 		return nil, mapError(err)
 	}

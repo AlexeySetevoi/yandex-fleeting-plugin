@@ -49,6 +49,7 @@ func main() {
 // выхода из процесса.
 func run() int {
 	name := flag.String("name", "smoketest", "instance group name / instance name prefix")
+	count := flag.Int("count", 1, "how many instances to request with a single Increase call")
 	folderID := flag.String("folder-id", "", "Yandex Cloud folder id (required)")
 	keyFile := flag.String("key-file", "", "service account authorized key file (or YC_SERVICE_ACCOUNT_KEY_FILE)")
 	zone := flag.String("zone", "", "availability zone, e.g. ru-central1-a")
@@ -134,27 +135,26 @@ func run() int {
 	}
 	logger.Info("initialized", "provider_id", info.ID, "max_size", info.MaxSize)
 
-	succeeded, err := g.Increase(ctx, 1)
+	increaseStarted := time.Now()
+	succeeded, err := g.Increase(ctx, *count)
+	logger.Info("increase returned", "requested", *count, "succeeded", succeeded, "took", time.Since(increaseStarted).Round(time.Millisecond).String())
 	if err != nil {
 		logger.Error("increase reported an error", "error", err)
 	}
-	if succeeded != 1 {
-		logger.Error("increase did not create the instance", "succeeded", succeeded)
-		return 1
-	}
 
-	// дальше инстанс существует и должен быть убран при любом исходе
-	var instanceID string
+	// дальше инстансы существуют и должны быть убраны при любом исходе, в том
+	// числе те, что создались при частичном успехе
 	defer func() {
-		if instanceID == "" {
+		ids := groupInstances(logger, g)
+		if len(ids) == 0 {
 			return
 		}
 		if *keep {
-			logger.Info("keeping instance alive (-keep set); clean it up manually in the console", "id", instanceID)
+			logger.Info("keeping instances alive (-keep set); clean them up manually in the console", "ids", ids)
 			return
 		}
 
-		deleted, err := g.Decrease(context.Background(), []string{instanceID})
+		deleted, err := g.Decrease(context.Background(), ids)
 		if err != nil {
 			logger.Error("decrease reported an error", "error", err)
 		}
@@ -165,40 +165,65 @@ func run() int {
 		}
 	}()
 
-	instanceID, err = waitUntilRunning(ctx, logger, g, *pollInterval, *readyTimeout)
-	if err != nil {
-		logger.Error("waiting for instance failed", "error", err)
+	if succeeded != *count {
+		logger.Error("increase did not create all instances", "succeeded", succeeded, "requested", *count)
 		return 1
 	}
 
-	logger.Info("instance is running, letting it settle before checking access", "duration", settle.String())
+	ids, err := waitUntilRunning(ctx, logger, g, *count, *pollInterval, *readyTimeout)
+	if err != nil {
+		logger.Error("waiting for instances failed", "error", err)
+		return 1
+	}
+	logger.Info("all instances are running", "count", len(ids), "since_increase", time.Since(increaseStarted).Round(time.Second).String())
+
+	logger.Info("letting instances settle before checking access", "duration", settle.String())
 	select {
 	case <-ctx.Done():
 		return 1
 	case <-time.After(*settle):
 	}
 
-	connectInfo, err := g.ConnectInfo(ctx, instanceID)
-	if err != nil {
-		logger.Error("connect info failed", "error", err)
+	failed := false
+	for _, id := range ids {
+		connectInfo, err := g.ConnectInfo(ctx, id)
+		if err != nil {
+			logger.Error("connect info failed", "id", id, "error", err)
+			failed = true
+			continue
+		}
+		logger.Info("connect info",
+			"id", id,
+			"external_addr", connectInfo.ExternalAddr,
+			"internal_addr", connectInfo.InternalAddr,
+			"username", connectInfo.Username,
+			"protocol", connectInfo.Protocol,
+			"has_key", len(connectInfo.Key) > 0,
+			"has_password", connectInfo.Password != "",
+		)
+
+		if err := checkAccess(ctx, logger, connectInfo, *accessTimeout, *accessRetryInterval, *checkCmd, *useExternalAddr); err != nil {
+			logger.Error("ACCESS CHECK FAILED", "id", id, "error", err)
+			failed = true
+		}
+	}
+	if failed {
 		return 1
 	}
-	logger.Info("connect info",
-		"external_addr", connectInfo.ExternalAddr,
-		"internal_addr", connectInfo.InternalAddr,
-		"username", connectInfo.Username,
-		"protocol", connectInfo.Protocol,
-		"has_key", len(connectInfo.Key) > 0,
-		"has_password", connectInfo.Password != "",
-	)
 
-	if err := checkAccess(ctx, logger, connectInfo, *accessTimeout, *accessRetryInterval, *checkCmd, *useExternalAddr); err != nil {
-		logger.Error("ACCESS CHECK FAILED", "error", err)
-		return 1
-	}
-
-	logger.Info("ACCESS CHECK PASSED")
+	logger.Info("ACCESS CHECK PASSED", "instances", len(ids))
 	return 0
+}
+
+// groupInstances — все инстансы группы, какие сейчас видит Update.
+func groupInstances(logger hclog.Logger, g *yandex.InstanceGroup) []string {
+	var ids []string
+	if err := g.Update(context.Background(), func(instance string, _ provider.State) {
+		ids = append(ids, instance)
+	}); err != nil {
+		logger.Error("update failed", "error", err)
+	}
+	return ids
 }
 
 func parsePlacements(value string) []yandex.Placement {
@@ -222,40 +247,37 @@ func parsePlacements(value string) []yandex.Placement {
 	return result
 }
 
-// waitUntilRunning опрашивает Update, пока инстанс не станет Running, и пишет
-// каждое увиденное состояние. Последний увиденный id возвращает и при
-// таймауте — чтобы вызывающий смог убрать машину, так и не дошедшую до Running.
-func waitUntilRunning(ctx context.Context, logger hclog.Logger, g *yandex.InstanceGroup, pollInterval, readyTimeout time.Duration) (string, error) {
+// waitUntilRunning опрашивает Update, пока все count инстансов не станут
+// Running, и пишет каждое увиденное состояние.
+func waitUntilRunning(ctx context.Context, logger hclog.Logger, g *yandex.InstanceGroup, count int, pollInterval, readyTimeout time.Duration) ([]string, error) {
 	deadline := time.Now().Add(readyTimeout)
 
-	var lastSeen string
-
 	for {
-		var found string
-		var state provider.State
-
-		if err := g.Update(ctx, func(instance string, s provider.State) {
-			found = instance
-			state = s
+		states := map[string]provider.State{}
+		if err := g.Update(ctx, func(instance string, state provider.State) {
+			states[instance] = state
 		}); err != nil {
 			logger.Error("update failed", "error", err)
 		}
 
-		if found != "" {
-			lastSeen = found
-			logger.Info("observed instance state", "id", found, "state", state)
+		var running []string
+		for id, state := range states {
+			logger.Info("observed instance state", "id", id, "state", state)
 			if state == provider.StateRunning {
-				return found, nil
+				running = append(running, id)
 			}
+		}
+		if len(running) == count {
+			return running, nil
 		}
 
 		if time.Now().After(deadline) {
-			return lastSeen, fmt.Errorf("timed out after %s waiting for the instance to become ready", readyTimeout)
+			return nil, fmt.Errorf("timed out after %s: %d of %d instances are running", readyTimeout, len(running), count)
 		}
 
 		select {
 		case <-ctx.Done():
-			return lastSeen, ctx.Err()
+			return nil, ctx.Err()
 		case <-time.After(pollInterval):
 		}
 	}

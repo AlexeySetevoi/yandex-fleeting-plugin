@@ -10,6 +10,7 @@ import (
 	"math"
 	"path"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/go-hclog"
 	"golang.org/x/sync/errgroup"
@@ -19,8 +20,14 @@ import (
 	"github.com/AlexeySetevoi/yandex-fleeting-plugin/internal/yandexapi"
 )
 
-// сколько инстансов создаём одновременно: каждое создание ждёт свою операцию
-const createConcurrency = 5
+const (
+	// сколько запросов на создание шлём одновременно
+	createConcurrency = 5
+
+	// на сколько размещение уходит в конец очереди после того, как в нём не
+	// хватило ресурсов
+	placementCooldown = 10 * time.Minute
+)
 
 // подменяется в тестах
 var newCompute = yandexapi.NewSDKCompute
@@ -92,6 +99,16 @@ type InstanceGroup struct {
 
 	placements      []Placement
 	sshKeysMetadata string
+
+	// За принятыми запросами на создание следят фоновые горутины: Increase
+	// их не ждёт, иначе встаёт весь цикл раннера (он однопоточный).
+	watchCtx    context.Context
+	watchCancel context.CancelFunc
+	watchers    sync.WaitGroup
+
+	now            func() time.Time
+	mu             sync.Mutex
+	exhaustedUntil map[Placement]time.Time
 }
 
 var _ provider.InstanceGroup = (*InstanceGroup)(nil)
@@ -119,6 +136,12 @@ func (g *InstanceGroup) Init(ctx context.Context, log hclog.Logger, settings pro
 
 	if err := g.setupSSHKey(); err != nil {
 		return provider.ProviderInfo{}, err
+	}
+
+	g.watchCtx, g.watchCancel = context.WithCancel(context.Background())
+	g.exhaustedUntil = map[Placement]time.Time{}
+	if g.now == nil {
+		g.now = time.Now
 	}
 
 	return provider.ProviderInfo{
@@ -153,6 +176,10 @@ func (g *InstanceGroup) Update(ctx context.Context, update func(instance string,
 	return nil
 }
 
+// Increase возвращается, как только облако приняло запросы: инстанс с этого
+// момента виден в Update как creating. Ошибки квоты, прав и конфигурации
+// приходят сразу и попадают в ответ; то, что выясняется позже (нехватка
+// ресурсов зоны), ловит watch.
 func (g *InstanceGroup) Increase(ctx context.Context, delta int) (int, error) {
 	var (
 		mu        sync.Mutex
@@ -165,7 +192,7 @@ func (g *InstanceGroup) Increase(ctx context.Context, delta int) (int, error) {
 
 	for range delta {
 		eg.Go(func() error {
-			instance, err := g.createInstance(ctx)
+			op, placement, err := g.createInstance(ctx)
 
 			mu.Lock()
 			defer mu.Unlock()
@@ -175,7 +202,8 @@ func (g *InstanceGroup) Increase(ctx context.Context, delta int) (int, error) {
 				return nil
 			}
 
-			g.log.Info("instance created", "id", instance.ID, "instance_name", instance.Name)
+			g.log.Info("instance requested", "id", op.InstanceID(), "zone", placement.Zone, "platform_id", placement.PlatformID)
+			g.watch(op, placement)
 			succeeded++
 			return nil
 		})
@@ -188,19 +216,20 @@ func (g *InstanceGroup) Increase(ctx context.Context, delta int) (int, error) {
 // createInstance перебирает варианты размещения по порядку; к следующему
 // переходит только когда не хватило ресурсов или квоты, любая другая ошибка
 // от смены зоны не вылечится.
-func (g *InstanceGroup) createInstance(ctx context.Context) (*yandexapi.Instance, error) {
+func (g *InstanceGroup) createInstance(ctx context.Context) (yandexapi.CreateOperation, Placement, error) {
 	imageID := g.ImageID
 	if g.ImageFamily != "" {
 		var err error
 		if imageID, err = g.client.LatestImageByFamily(ctx, g.ImageFolderID, g.ImageFamily); err != nil {
-			return nil, fmt.Errorf("could not resolve image family %s/%s: %w", g.ImageFolderID, g.ImageFamily, err)
+			return nil, Placement{}, fmt.Errorf("could not resolve image family %s/%s: %w", g.ImageFolderID, g.ImageFamily, err)
 		}
 	}
 
 	var errs []error
 
-	for i, p := range g.placements {
-		instance, err := g.client.CreateInstance(ctx, yandexapi.CreateInstanceRequest{
+	candidates := g.orderedPlacements()
+	for i, p := range candidates {
+		op, err := g.client.CreateInstance(ctx, yandexapi.CreateInstanceRequest{
 			FolderID: g.FolderID,
 			// имя новое на каждую попытку, чтобы не упереться в уникальность
 			Name:             g.Name + "-" + randomSuffix(),
@@ -222,12 +251,12 @@ func (g *InstanceGroup) createInstance(ctx context.Context) (*yandexapi.Instance
 			Preemptible:      g.Preemptible,
 		})
 		if err == nil {
-			return instance, nil
+			return op, p, nil
 		}
 
 		errs = append(errs, fmt.Errorf("zone %s platform %s: %w", p.Zone, p.PlatformID, err))
 
-		if i < len(g.placements)-1 && errors.Is(err, yandexapi.ErrResourceExhausted) {
+		if i < len(candidates)-1 && errors.Is(err, yandexapi.ErrResourceExhausted) {
 			g.log.Warn("not enough resources, trying next placement", "zone", p.Zone, "platform_id", p.PlatformID, "error", err)
 			continue
 		}
@@ -235,7 +264,59 @@ func (g *InstanceGroup) createInstance(ctx context.Context) (*yandexapi.Instance
 		break
 	}
 
-	return nil, fmt.Errorf("could not create instance: %w", errors.Join(errs...))
+	return nil, Placement{}, fmt.Errorf("could not create instance: %w", errors.Join(errs...))
+}
+
+// orderedPlacements — размещения в порядке из конфига, но те, где недавно не
+// хватило ресурсов, идут последними: их пробуем, только если остальные отказали.
+func (g *InstanceGroup) orderedPlacements() []Placement {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	now := g.now()
+
+	ordered := make([]Placement, 0, len(g.placements))
+	var exhausted []Placement
+	for _, p := range g.placements {
+		if until, ok := g.exhaustedUntil[p]; ok && now.Before(until) {
+			exhausted = append(exhausted, p)
+			continue
+		}
+		delete(g.exhaustedUntil, p)
+		ordered = append(ordered, p)
+	}
+
+	return append(ordered, exhausted...)
+}
+
+// watch дожидается операции создания в фоне. Упавшую операцию облако
+// откатывает само: инстанс пропадает из списка, и раннер запрашивает замену —
+// к тому моменту размещение уже в конце очереди.
+func (g *InstanceGroup) watch(op yandexapi.CreateOperation, p Placement) {
+	g.watchers.Add(1)
+
+	go func() {
+		defer g.watchers.Done()
+
+		instance, err := op.Wait(g.watchCtx)
+		if err == nil {
+			g.log.Info("instance created", "id", instance.ID, "instance_name", instance.Name)
+			return
+		}
+		if g.watchCtx.Err() != nil {
+			return // плагин останавливается, операция здесь ни при чём
+		}
+
+		g.log.Error("instance creation failed after the request was accepted", "id", op.InstanceID(), "zone", p.Zone, "platform_id", p.PlatformID, "error", err)
+
+		if errors.Is(err, yandexapi.ErrResourceExhausted) {
+			g.mu.Lock()
+			g.exhaustedUntil[p] = g.now().Add(placementCooldown)
+			g.mu.Unlock()
+
+			g.log.Warn("placement moved to the end of the list", "zone", p.Zone, "platform_id", p.PlatformID, "for", placementCooldown)
+		}
+	}()
 }
 
 func (g *InstanceGroup) instanceLabels() map[string]string {
@@ -316,6 +397,11 @@ func (g *InstanceGroup) Resume(_ context.Context, _ []string) ([]string, error) 
 }
 
 func (g *InstanceGroup) Shutdown(ctx context.Context) error {
+	if g.watchCancel != nil {
+		g.watchCancel()
+		g.watchers.Wait()
+	}
+
 	if g.client == nil {
 		return nil
 	}

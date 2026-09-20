@@ -346,11 +346,11 @@ func TestSDKGetInstance(t *testing.T) {
 	}
 }
 
-func TestSDKCreateInstanceWaitsForOperation(t *testing.T) {
+func TestSDKCreateInstance(t *testing.T) {
 	cloud := &fakeCloud{pendingPolls: 2}
 	client := newTestCompute(t, cloud)
 
-	instance, err := client.CreateInstance(testContext(t), CreateInstanceRequest{
+	op, err := client.CreateInstance(testContext(t), CreateInstanceRequest{
 		FolderID:         "folder-1",
 		Name:             "runner-aaaa1111",
 		Labels:           map[string]string{"fleeting-group": "runner"},
@@ -373,8 +373,21 @@ func TestSDKCreateInstanceWaitsForOperation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateInstance() = %v", err)
 	}
+
+	// запрос принят: id известен сразу, операцию никто не ждал
+	if op.InstanceID() != "new-instance" {
+		t.Fatalf("InstanceID() = %q", op.InstanceID())
+	}
+	if cloud.polls != 0 {
+		t.Fatalf("CreateInstance() polled the operation %d times, want it to return right after the request is accepted", cloud.polls)
+	}
+
+	instance, err := op.Wait(testContext(t))
+	if err != nil {
+		t.Fatalf("Wait() = %v", err)
+	}
 	if instance.ID != "new-instance" || instance.Name != "runner-aaaa1111" || instance.InternalIP != "10.0.0.9" {
-		t.Fatalf("CreateInstance() = %+v", instance)
+		t.Fatalf("Wait() = %+v", instance)
 	}
 	if cloud.polls != 3 {
 		t.Fatalf("operation polls = %d, want 3 (two pending, one done)", cloud.polls)
@@ -436,7 +449,7 @@ func TestSDKCreateInstanceWithoutNAT(t *testing.T) {
 }
 
 // Нехватка ресурсов зоны приходит в результате операции, а не в ответе на
-// Create — именно ради этого CreateInstance ждёт операцию.
+// Create — поэтому её отдаёт Wait, а сам запрос считается принятым.
 func TestSDKCreateInstanceOperationFails(t *testing.T) {
 	cloud := &fakeCloud{
 		pendingPolls: 1,
@@ -444,9 +457,13 @@ func TestSDKCreateInstanceOperationFails(t *testing.T) {
 	}
 	client := newTestCompute(t, cloud)
 
-	_, err := client.CreateInstance(testContext(t), CreateInstanceRequest{Name: "runner-cccc3333"})
-	if !errors.Is(err, ErrResourceExhausted) {
-		t.Fatalf("CreateInstance() = %v, want ErrResourceExhausted", err)
+	op, err := client.CreateInstance(testContext(t), CreateInstanceRequest{Name: "runner-cccc3333"})
+	if err != nil {
+		t.Fatalf("CreateInstance() = %v, want the request to be accepted", err)
+	}
+
+	if _, err := op.Wait(testContext(t)); !errors.Is(err, ErrResourceExhausted) {
+		t.Fatalf("Wait() = %v, want ErrResourceExhausted", err)
 	}
 }
 
@@ -485,15 +502,19 @@ func TestSDKCreateInstanceRequestFails(t *testing.T) {
 	}
 }
 
-func TestSDKCreateInstanceContextCancelled(t *testing.T) {
+func TestSDKCreateOperationWaitCancelled(t *testing.T) {
 	cloud := &fakeCloud{pendingPolls: 1 << 30}
 	client := newTestCompute(t, cloud)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 
-	if _, err := client.CreateInstance(ctx, CreateInstanceRequest{Name: "runner-eeee5555"}); err == nil {
-		t.Fatal("CreateInstance() = nil although the operation never finished")
+	op, err := client.CreateInstance(testContext(t), CreateInstanceRequest{Name: "runner-eeee5555"})
+	if err != nil {
+		t.Fatalf("CreateInstance() = %v", err)
+	}
+	if _, err := op.Wait(ctx); err == nil {
+		t.Fatal("Wait() = nil although the operation never finished")
 	}
 }
 

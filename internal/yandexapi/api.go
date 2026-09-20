@@ -64,13 +64,22 @@ type CreateInstanceRequest struct {
 	Preemptible      bool
 }
 
+// CreateOperation — принятый облаком запрос на создание инстанса.
+type CreateOperation interface {
+	// InstanceID известен сразу: инстанс уже виден в списке как PROVISIONING.
+	InstanceID() string
+	// Wait ждёт конца операции. Нехватка ресурсов зоны приходит именно здесь,
+	// а не в ответе на запрос.
+	Wait(ctx context.Context) (*Instance, error)
+}
+
 type Compute interface {
 	// ListInstances возвращает все инстансы каталога (пагинация внутри).
 	ListInstances(ctx context.Context, folderID string) ([]Instance, error)
 	GetInstance(ctx context.Context, id string) (*Instance, error)
-	// CreateInstance ждёт завершения операции: нехватка ресурсов зоны
-	// приходит именно в её результате.
-	CreateInstance(ctx context.Context, req CreateInstanceRequest) (*Instance, error)
+	// CreateInstance возвращается, как только облако приняло запрос; ошибки
+	// квоты, прав и валидации приходят сразу, остальное — в CreateOperation.Wait.
+	CreateInstance(ctx context.Context, req CreateInstanceRequest) (CreateOperation, error)
 	// DeleteInstance операцию не ждёт.
 	DeleteInstance(ctx context.Context, id string) error
 	LatestImageByFamily(ctx context.Context, folderID, family string) (string, error)
