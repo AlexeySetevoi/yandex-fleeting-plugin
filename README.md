@@ -64,22 +64,49 @@ go build -o fleeting-plugin-yandex ./cmd/fleeting-plugin-yandex
 
 На каждый тег `X.Y.Z` GitHub Actions собирает бинари под `linux`/`darwin` × `amd64`/`arm64`, а для Linux ещё и
 пакеты `deb`/`rpm`, и прикладывает всё к
-[релизу](https://github.com/AlexeySetevoi/yandex-fleeting-plugin/releases).
+[релизу](https://github.com/AlexeySetevoi/yandex-fleeting-plugin/releases). Пакеты `deb` вдобавок публикуются в
+APT-репозиторий на GitHub Pages.
 
 Пакет кладёт бинарь в `/usr/bin/fleeting-plugin-yandex`, поэтому в конфиге раннера достаточно имени:
 `plugin = "fleeting-plugin-yandex"`.
 
+### Debian/Ubuntu: APT-репозиторий
+
+Один репозиторий на любой Debian и Ubuntu (бинарь статический), `amd64` и `arm64`. Обновление — обычным
+`apt upgrade` вместе с системой.
+
+```shell
+sudo install -d -m 0755 /etc/apt/keyrings
+curl -fsSL https://alexeysetevoi.github.io/yandex-fleeting-plugin/fleeting-plugin-yandex.gpg \
+  | sudo tee /etc/apt/keyrings/fleeting-plugin-yandex.gpg >/dev/null
+echo "deb [signed-by=/etc/apt/keyrings/fleeting-plugin-yandex.gpg] https://alexeysetevoi.github.io/yandex-fleeting-plugin stable main" \
+  | sudo tee /etc/apt/sources.list.d/fleeting-plugin-yandex.list
+sudo apt update
+sudo apt install fleeting-plugin-yandex
+```
+
+Проверить, что скачан ключ проекта:
+
+```shell
+gpg --show-keys /etc/apt/keyrings/fleeting-plugin-yandex.gpg
+```
+
+Отпечаток должен быть `82B3 6F97 AD8D 2A0C 4FB0  49D5 78AB 270A ED1D C16D`.
+
+В репозитории только последняя версия; предыдущие — в релизах.
+
+### Пакет или бинарь из релиза
+
 ```shell
 # Debian/Ubuntu
 curl -fsSLO "https://github.com/AlexeySetevoi/yandex-fleeting-plugin/releases/download/<версия>/fleeting-plugin-yandex_<версия>_amd64.deb"
-sudo dpkg -i fleeting-plugin-yandex_<версия>_amd64.deb
+sudo apt install ./fleeting-plugin-yandex_<версия>_amd64.deb
 
 # RHEL/Rocky/Alma
 sudo rpm -Uvh "https://github.com/AlexeySetevoi/yandex-fleeting-plugin/releases/download/<версия>/fleeting-plugin-yandex-<версия>-1.x86_64.rpm"
 ```
 
-Для arm64 — `_arm64.deb` и `.aarch64.rpm`. Пока репозиторий приватный, скачивание требует токен
-(`gh release download <версия> -p '*.deb'`).
+Для arm64 — `_arm64.deb` и `.aarch64.rpm`.
 
 Либо просто бинарь:
 
@@ -91,8 +118,10 @@ chmod +x fleeting-plugin-yandex
 
 ### Проверка подлинности
 
-Ключей GPG у проекта нет — используется то, что даёт сам GitHub (подписи Sigstore, привязанные к репозиторию,
-workflow, коммиту и тегу):
+- **GPG-ключ проекта** (`keys/fleeting-plugin-yandex.asc`, он же лежит в каждом релизе и на Pages) — им подписан
+  APT-репозиторий (`InRelease`, `apt` проверяет его сам) и `SHA256SUMS` в релизе (`SHA256SUMS.asc`).
+
+Остальное даёт сам GitHub (подписи Sigstore, привязанные к репозиторию, workflow, коммиту и тегу):
 
 - **аттестация происхождения** (build provenance) — на каждый файл релиза: бинари, `deb`, `rpm`, SBOM, `SHA256SUMS`;
 - **аттестация SBOM** — к каждому бинарю и пакету привязан SBOM (SPDX, снят с бинаря через syft); сами
@@ -119,16 +148,21 @@ gh attestation verify $F -R $R                                                  
 gh attestation verify $F -R $R --predicate-type https://spdx.dev/Document/v2.3    # SBOM
 gh release verify <версия> -R $R                                                  # релиз не подменён
 gh release verify-asset <версия> $F -R $R                                         # файл именно из этого релиза
+
+gpg --import fleeting-plugin-yandex.asc   # без gh: подпись SHA256SUMS ключом проекта
+gpg --verify SHA256SUMS.asc SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
 ```
 
 Нужен свежий `gh` с [cli.github.com](https://cli.github.com/): в 2.46 из репозитория Ubuntu команд `attestation` и
 `release verify` ещё нет.
 
-Это не GPG-подпись внутри пакета: `rpm -K`, `dnf` и `apt` её не видят, проверка — только через `gh`.
+Сами пакеты не подписаны: `rpm -K` и `dnf` подпись не видят; для `apt` подписан репозиторий, для файлов из
+релиза — `SHA256SUMS`.
 
 С ВМ внутри Yandex Cloud `github.com` может не открываться (в проверочном прогоне соединение не устанавливалось
 вовсе, `packages.gitlab.com` отвечал через раз) — тогда скачайте пакет там, где GitHub доступен, и скопируйте на хост.
+APT-репозиторий живёт на `alexeysetevoi.github.io`, это другой хост — доступность проверяйте отдельно.
 
 1. Поставить пакет либо положить бинарь на хост, где крутится `gitlab-runner` (например,
    `/etc/gitlab-runner/plugins/fleeting-plugin-yandex`, `root:root`, `0755`).
@@ -414,8 +448,13 @@ Compute API не генерирует и не отдаёт пароль адми
 - `.github/workflows/ci.yml` — на каждый пуш в `main` и pull request: `go mod tidy -diff`, `go mod verify`, `vet`,
   тесты с `-race` (покрытие — в summary джобы), `golangci-lint` (`.golangci.yml`) и пробная сборка релиза
   [GoReleaser](https://goreleaser.com/)-ом без публикации — конфиг релиза проверяется постоянно, а не в момент выпуска.
-- На тег `X.Y.Z` — релиз: GoReleaser (`.goreleaser.yaml`) собирает бинари `linux/darwin` × `amd64/arm64`, `deb`/`rpm`,
-  SBOM и `SHA256SUMS` и создаёт релиз-черновик; затем выпускаются аттестации, и последним шагом релиз публикуется.
+  Из пробных `deb` собирается APT-репозиторий одноразовым ключом, и пакет ставится через `apt` в чистых
+  `ubuntu:26.04`, `ubuntu:24.04`, `debian:13` на `amd64` и `arm64` (`scripts/test-apt-repo.sh`).
+- `.github/workflows/release.yml` — на тег `X.Y.Z`: сначала весь `ci`, затем GoReleaser (`.goreleaser.yaml`) собирает
+  бинари `linux/darwin` × `amd64/arm64`, `deb`/`rpm`, SBOM и `SHA256SUMS` и создаёт релиз-черновик; `SHA256SUMS`
+  подписывается ключом проекта, выпускаются аттестации, собирается APT-репозиторий (`scripts/build-apt-repo.sh`) и
+  выкладывается на Pages, и последним шагом релиз публикуется. Ключ — в секретах `APT_SIGNING_KEY` и
+  `APT_SIGNING_PASSPHRASE`.
 - `.github/workflows/govulncheck.yml` — `govulncheck` на пуш и раз в неделю. Отдельно от `ci`, чтобы уязвимость в
   зависимости, для которой ещё нет исправления, была видна, но не блокировала релизы.
 - `.github/dependabot.yml` — еженедельные обновления Go-модулей и экшенов. Экшены закреплены по SHA коммита.

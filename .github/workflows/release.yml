@@ -1,0 +1,150 @@
+name: release
+
+on:
+  push:
+    tags: ["[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+
+      # сборка, deb/rpm, SBOM, SHA256SUMS и релиз-черновик со всеми файлами
+      - uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: v2.18.2
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: import the signing key
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+        run: |
+          [ -n "$APT_SIGNING_KEY" ] || { echo "APT_SIGNING_KEY secret is not set" >&2; exit 1; }
+          gpg --batch --import <<<"$APT_SIGNING_KEY"
+          fpr=$(gpg --with-colons --list-secret-keys | awk -F: '/^fpr/{print $10; exit}')
+          [ "$fpr" = "$(gpg --with-colons --show-keys keys/fleeting-plugin-yandex.asc | awk -F: '/^fpr/{print $10; exit}')" ] \
+            || { echo "secret key does not match keys/fleeting-plugin-yandex.asc" >&2; exit 1; }
+          echo "SIGNING_KEY=$fpr" >> "$GITHUB_ENV"
+
+      # GPG-подпись SHA256SUMS — для проверки без gh; кладётся в черновик вместе с ключом
+      - name: sign SHA256SUMS
+        env:
+          GPG_PASSPHRASE: ${{ secrets.APT_SIGNING_PASSPHRASE }}
+        run: |
+          gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 --local-user "$SIGNING_KEY" \
+            --armor --detach-sign -o dist/SHA256SUMS.asc dist/SHA256SUMS 3<<<"$GPG_PASSPHRASE"
+          gpg --verify dist/SHA256SUMS.asc dist/SHA256SUMS
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            dist/SHA256SUMS.asc keys/fleeting-plugin-yandex.asc
+
+      # Аттестации (Sigstore, без своих ключей), проверяются через
+      # gh attestation verify. В приватном репозитории личного аккаунта GitHub
+      # их не даёт, поэтому шаги работают только в публичном.
+      - name: attest provenance of every release file
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      # сам SHA256SUMS и его подпись в нём не перечислены — отдельно
+      - name: attest provenance of SHA256SUMS
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            dist/SHA256SUMS
+            dist/SHA256SUMS.asc
+
+      # SBOM снят с бинаря; deb и rpm той же архитектуры содержат этот же бинарь
+      - name: split checksums per platform
+        if: ${{ !github.event.repository.private }}
+        run: |
+          grep -E '(-linux-amd64|_amd64\.deb|\.x86_64\.rpm)$' dist/SHA256SUMS > sums-linux-amd64
+          grep -E '(-linux-arm64|_arm64\.deb|\.aarch64\.rpm)$' dist/SHA256SUMS > sums-linux-arm64
+          grep -E -- '-darwin-amd64$' dist/SHA256SUMS > sums-darwin-amd64
+          grep -E -- '-darwin-arm64$' dist/SHA256SUMS > sums-darwin-arm64
+          wc -l sums-*
+      - name: attest sbom linux/amd64
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: sums-linux-amd64
+          sbom-path: dist/fleeting-plugin-yandex-linux-amd64.spdx.json
+      - name: attest sbom linux/arm64
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: sums-linux-arm64
+          sbom-path: dist/fleeting-plugin-yandex-linux-arm64.spdx.json
+      - name: attest sbom darwin/amd64
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: sums-darwin-amd64
+          sbom-path: dist/fleeting-plugin-yandex-darwin-amd64.spdx.json
+      - name: attest sbom darwin/arm64
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: sums-darwin-arm64
+          sbom-path: dist/fleeting-plugin-yandex-darwin-arm64.spdx.json
+
+      - name: apt repository
+        env:
+          GPG_PASSPHRASE: ${{ secrets.APT_SIGNING_PASSPHRASE }}
+        run: |
+          command -v apt-ftparchive || sudo apt-get install -y -qq apt-utils
+          scripts/build-apt-repo.sh dist site "$SIGNING_KEY"
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site
+
+  pages:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+
+  # публикация — последней: после неё релиз неизменяемый
+  publish:
+    needs: pages
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
