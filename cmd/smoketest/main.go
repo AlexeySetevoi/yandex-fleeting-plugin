@@ -146,20 +146,20 @@ func run() int {
 	// числе те, что создались при частичном успехе
 	defer func() {
 		ids := groupInstances(logger, g)
-		if len(ids) == 0 {
-			return
-		}
 		if *keep {
 			logger.Info("keeping instances alive (-keep set); clean them up manually in the console", "ids", ids)
 			return
 		}
 
-		deleted, err := g.Decrease(context.Background(), ids)
-		if err != nil {
-			logger.Error("decrease reported an error", "error", err)
+		if len(ids) > 0 {
+			deleted, err := g.Decrease(context.Background(), ids)
+			if err != nil {
+				logger.Error("decrease reported an error", "error", err)
+			}
+			logger.Info("decreased", "deleted", deleted)
 		}
-		logger.Info("decreased", "deleted", deleted)
 
+		// Shutdown останавливает фоновые watch и закрывает SDK — и когда инстансов нет
 		if err := g.Shutdown(context.Background()); err != nil {
 			logger.Error("shutdown failed", "error", err)
 		}
