@@ -5,9 +5,9 @@ go 1.26.8
 require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/hashicorp/go-hclog v1.6.3
-	github.com/yandex-cloud/go-genproto v0.122.0
-	github.com/yandex-cloud/go-sdk/services/compute v1.0.103
-	github.com/yandex-cloud/go-sdk/v2 v2.177.0
+	github.com/yandex-cloud/go-genproto v0.124.0
+	github.com/yandex-cloud/go-sdk/services/compute v1.0.105
+	github.com/yandex-cloud/go-sdk/v2 v2.178.0
 	gitlab.com/gitlab-org/fleeting/fleeting v0.0.0-20260728133024-9832b1044ee2
 	golang.org/x/crypto v0.57.0
 	golang.org/x/sync v0.23.0
