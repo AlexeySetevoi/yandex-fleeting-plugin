@@ -306,7 +306,7 @@ func (g *InstanceGroup) orderedPlacements() []Placement {
 		start = g.nextPlacement % n
 		g.nextPlacement = (start + 1) % n
 	case strategyRandom:
-		start = mrand.IntN(n)
+		start = mrand.IntN(n) //nolint:gosec // выбор зоны, не криптография
 	}
 
 	ordered := make([]Placement, 0, n)
