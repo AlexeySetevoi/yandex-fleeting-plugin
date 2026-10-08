@@ -474,6 +474,8 @@ func TestSDKCreateInstanceRequestFails(t *testing.T) {
 		sentinel error
 	}{
 		{name: "quota", err: status.Error(codes.ResourceExhausted, "quota exceeded"), sentinel: ErrResourceExhausted},
+		{name: "unavailable", err: status.Error(codes.Unavailable, "zone is unavailable"), sentinel: ErrUnavailable},
+		{name: "internal", err: status.Error(codes.Internal, "internal error"), sentinel: ErrUnavailable},
 		{name: "permission denied", err: status.Error(codes.PermissionDenied, "denied")},
 	}
 
@@ -492,7 +494,8 @@ func TestSDKCreateInstanceRequestFails(t *testing.T) {
 			if tt.sentinel != nil && !errors.Is(err, tt.sentinel) {
 				t.Fatalf("CreateInstance() = %v, want %v", err, tt.sentinel)
 			}
-			if errors.Is(err, ErrResourceExhausted) != errors.Is(tt.sentinel, ErrResourceExhausted) {
+			if errors.Is(err, ErrResourceExhausted) != errors.Is(tt.sentinel, ErrResourceExhausted) ||
+				errors.Is(err, ErrUnavailable) != errors.Is(tt.sentinel, ErrUnavailable) {
 				t.Fatalf("CreateInstance() = %v: would trigger a placement fallback it should not", err)
 			}
 			if cloud.polls != 0 {

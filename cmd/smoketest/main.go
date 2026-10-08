@@ -56,6 +56,7 @@ func run() int {
 	subnetID := flag.String("subnet-id", "", "subnet id in that zone")
 	platformID := flag.String("platform-id", "", "platform id (default standard-v3)")
 	placements := flag.String("placements", "", "comma separated zone:subnet_id[:platform_id] fallback list, instead of -zone/-subnet-id/-platform-id")
+	placementStrategy := flag.String("placement-strategy", "", "ordered (default), round_robin or random")
 	cores := flag.Int("cores", 2, "vCPU count")
 	memoryGB := flag.Float64("memory-gb", 2, "RAM, GB")
 	coreFraction := flag.Int("core-fraction", 20, "guaranteed vCPU share, %")
@@ -102,6 +103,7 @@ func run() int {
 		SubnetID:              *subnetID,
 		PlatformID:            *platformID,
 		Placements:            parsePlacements(*placements),
+		PlacementStrategy:     *placementStrategy,
 		Cores:                 *cores,
 		MemoryGB:              *memoryGB,
 		CoreFraction:          *coreFraction,

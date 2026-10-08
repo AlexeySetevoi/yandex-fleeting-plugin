@@ -349,6 +349,25 @@ func TestIncreaseNoFallbackOnOtherErrors(t *testing.T) {
 	}
 }
 
+// Авария зоны приходит как Unavailable/Internal: в другой зоне запрос пройдёт.
+func TestIncreaseFallbackOnUnavailableZone(t *testing.T) {
+	fake := &fakeCompute{create: func(req yandexapi.CreateInstanceRequest) error {
+		if req.Zone == "ru-central1-a" {
+			return fmt.Errorf("%w: zone is down", yandexapi.ErrUnavailable)
+		}
+		return nil
+	}}
+	g := asyncPlacementsGroup()
+	initGroup(t, g, fake, provider.Settings{})
+
+	if succeeded, err := g.Increase(context.Background(), 1); err != nil || succeeded != 1 {
+		t.Fatalf("Increase() = %d, %v", succeeded, err)
+	}
+	if len(fake.created) != 2 || fake.created[1].Zone != "ru-central1-b" {
+		t.Fatalf("create attempts = %+v, want a fallback to ru-central1-b", fake.created)
+	}
+}
+
 func TestIncreasePartialSuccess(t *testing.T) {
 	var calls int
 	fake := &fakeCompute{}
@@ -725,6 +744,106 @@ func TestAllPlacementsExhaustedAreStillTried(t *testing.T) {
 	want := []string{"ru-central1-a", "ru-central1-b", "ru-central1-a"}
 	if strings.Join(zones, ",") != strings.Join(want, ",") {
 		t.Fatalf("zones tried = %v, want %v", zones, want)
+	}
+}
+
+func threeZoneGroup(strategy string) *InstanceGroup {
+	g := validGroup()
+	g.Zone, g.SubnetID = "", ""
+	g.Placements = []Placement{
+		{Zone: "ru-central1-a", SubnetID: "subnet-a"},
+		{Zone: "ru-central1-b", SubnetID: "subnet-b"},
+		{Zone: "ru-central1-d", SubnetID: "subnet-d"},
+	}
+	g.PlacementStrategy = strategy
+	return g
+}
+
+// round_robin раскладывает инстансы по зонам по очереди.
+func TestRoundRobinSpreadsAcrossZones(t *testing.T) {
+	fake := &fakeCompute{}
+	g := threeZoneGroup(strategyRoundRobin)
+	initGroup(t, g, fake, provider.Settings{})
+
+	if succeeded, err := g.Increase(context.Background(), 6); err != nil || succeeded != 6 {
+		t.Fatalf("Increase() = %d, %v", succeeded, err)
+	}
+
+	perZone := map[string]int{}
+	for _, req := range fake.created {
+		perZone[req.Zone]++
+	}
+	for _, zone := range []string{"ru-central1-a", "ru-central1-b", "ru-central1-d"} {
+		if perZone[zone] != 2 {
+			t.Fatalf("instances per zone = %v, want 2 in each", perZone)
+		}
+	}
+}
+
+// Отказавшая зона уходит в конец, round_robin крутится по живым, а запрос,
+// попавший на мёртвую зону, сразу уходит в следующую.
+func TestRoundRobinSkipsFailedZone(t *testing.T) {
+	fake := &fakeCompute{create: func(req yandexapi.CreateInstanceRequest) error {
+		if req.Zone == "ru-central1-b" {
+			return fmt.Errorf("%w: zone is down", yandexapi.ErrUnavailable)
+		}
+		return nil
+	}}
+	g := threeZoneGroup(strategyRoundRobin)
+	initGroup(t, g, fake, provider.Settings{})
+
+	var zones []string
+	for range 4 {
+		if succeeded, err := g.Increase(context.Background(), 1); err != nil || succeeded != 1 {
+			t.Fatalf("Increase() = %d, %v", succeeded, err)
+		}
+		zones = append(zones, fake.created[len(fake.created)-1].Zone)
+	}
+
+	want := []string{"ru-central1-a", "ru-central1-d", "ru-central1-d", "ru-central1-a"}
+	if strings.Join(zones, ",") != strings.Join(want, ",") {
+		t.Fatalf("zones = %v, want %v", zones, want)
+	}
+}
+
+// Асинхронная авария зоны тоже отправляет размещение в конец очереди.
+func TestAsyncUnavailableMovesPlacementToTheEnd(t *testing.T) {
+	fake := &fakeCompute{opErr: func(req yandexapi.CreateInstanceRequest) error {
+		if req.Zone == "ru-central1-a" {
+			return fmt.Errorf("%w: zone is down", yandexapi.ErrUnavailable)
+		}
+		return nil
+	}}
+	g := asyncPlacementsGroup()
+	initGroup(t, g, fake, provider.Settings{})
+
+	for range 2 {
+		if succeeded, err := g.Increase(context.Background(), 1); err != nil || succeeded != 1 {
+			t.Fatalf("Increase() = %d, %v", succeeded, err)
+		}
+		g.watchers.Wait()
+	}
+	if zone := fake.created[1].Zone; zone != "ru-central1-b" {
+		t.Fatalf("request after the async failure went to %s, want ru-central1-b", zone)
+	}
+}
+
+// random начинает с любой зоны, фолбэк всё равно обходит все.
+func TestRandomCoversAllZones(t *testing.T) {
+	fake := &fakeCompute{}
+	g := threeZoneGroup(strategyRandom)
+	initGroup(t, g, fake, provider.Settings{})
+
+	seen := map[string]bool{}
+	for range 200 {
+		order := g.orderedPlacements()
+		if len(order) != 3 {
+			t.Fatalf("placements = %v, want all 3", order)
+		}
+		seen[order[0].Zone] = true
+	}
+	if len(seen) != 3 {
+		t.Fatalf("first placements seen = %v, want all 3 zones", seen)
 	}
 }
 

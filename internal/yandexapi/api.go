@@ -12,6 +12,9 @@ var (
 	ErrNotFound = errors.New("not found")
 	// ErrResourceExhausted — не хватило квоты или ресурсов зоны/платформы.
 	ErrResourceExhausted = errors.New("resource exhausted")
+	// ErrUnavailable — облако не смогло выполнить запрос (Unavailable,
+	// Internal): так выглядит авария зоны, в другой зоне запрос может пройти.
+	ErrUnavailable = errors.New("unavailable")
 )
 
 // Статусы инстанса, как их отдаёт Compute API.

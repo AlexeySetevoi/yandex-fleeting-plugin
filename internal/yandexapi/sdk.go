@@ -182,6 +182,8 @@ func mapError(err error) error {
 		return fmt.Errorf("%w: %w", ErrNotFound, err)
 	case codes.ResourceExhausted:
 		return fmt.Errorf("%w: %w", ErrResourceExhausted, err)
+	case codes.Unavailable, codes.Internal:
+		return fmt.Errorf("%w: %w", ErrUnavailable, err)
 	default:
 		return err
 	}

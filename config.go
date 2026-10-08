@@ -109,6 +109,12 @@ func (g *InstanceGroup) validate() error {
 		}
 	}
 
+	switch g.PlacementStrategy {
+	case "", strategyOrdered, strategyRoundRobin, strategyRandom:
+	default:
+		errs = append(errs, fmt.Errorf("invalid plugin config placement_strategy %q: must be one of %s, %s, %s", g.PlacementStrategy, strategyOrdered, strategyRoundRobin, strategyRandom))
+	}
+
 	if g.Cores <= 0 {
 		errs = append(errs, errors.New("missing required plugin config: cores"))
 	}
@@ -163,6 +169,9 @@ func (g *InstanceGroup) populate() error {
 		g.UserData = string(data)
 	}
 
+	if g.PlacementStrategy == "" {
+		g.PlacementStrategy = strategyOrdered
+	}
 	if g.CoreFraction == 0 {
 		g.CoreFraction = 100
 	}
