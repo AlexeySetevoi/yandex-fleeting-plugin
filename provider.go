@@ -25,8 +25,7 @@ const (
 	// сколько запросов на создание шлём одновременно
 	createConcurrency = 5
 
-	// на сколько размещение уходит в конец очереди после того, как в нём не
-	// хватило ресурсов или зона не ответила
+	// на сколько размещение уходит в конец очереди после отказа
 	placementCooldown = 10 * time.Minute
 )
 
@@ -231,9 +230,11 @@ func (g *InstanceGroup) Increase(ctx context.Context, delta int) (int, error) {
 	return succeeded, errors.Join(errs...)
 }
 
-// createInstance перебирает варианты размещения по порядку; к следующему
-// переходит только когда не хватило ресурсов или квоты либо зона не ответила,
-// любая другая ошибка от смены зоны не вылечится.
+// createInstance перебирает варианты размещения по порядку и переходит к
+// следующему при любой ошибке: авария зоны приходит под разными кодами
+// (ResourceExhausted, Unavailable, FailedPrecondition "Zone is down",
+// PermissionDenied на подсеть), по коду её от ошибки конфигурации не отличить.
+// Ошибка конфигурации повторится во всех вариантах и вернётся вместе с ними.
 func (g *InstanceGroup) createInstance(ctx context.Context) (yandexapi.CreateOperation, Placement, error) {
 	imageID := g.ImageID
 	if g.ImageFamily != "" {
@@ -274,20 +275,28 @@ func (g *InstanceGroup) createInstance(ctx context.Context) (yandexapi.CreateOpe
 
 		errs = append(errs, fmt.Errorf("zone %s platform %s: %w", p.Zone, p.PlatformID, err))
 
-		if i < len(candidates)-1 && placementFailure(err) {
-			g.log.Warn("placement failed, trying next placement", "zone", p.Zone, "platform_id", p.PlatformID, "error", err)
-			continue
+		// отменённый запрос раннера — не отказ размещения
+		if ctx.Err() != nil {
+			break
 		}
+		g.deferPlacement(p)
 
-		break
+		if i < len(candidates)-1 {
+			g.log.Warn("placement failed, trying next placement", "zone", p.Zone, "platform_id", p.PlatformID, "error", err)
+		}
 	}
 
 	return nil, Placement{}, fmt.Errorf("could not create instance: %w", errors.Join(errs...))
 }
 
-// placementFailure — ошибки, которые лечатся сменой зоны или платформы.
-func placementFailure(err error) bool {
-	return errors.Is(err, yandexapi.ErrResourceExhausted) || errors.Is(err, yandexapi.ErrUnavailable)
+// deferPlacement отправляет отказавшее размещение в конец очереди на
+// placementCooldown.
+func (g *InstanceGroup) deferPlacement(p Placement) {
+	g.mu.Lock()
+	g.exhaustedUntil[p] = g.now().Add(placementCooldown)
+	g.mu.Unlock()
+
+	g.log.Warn("placement moved to the end of the list", "zone", p.Zone, "platform_id", p.PlatformID, "for", placementCooldown)
 }
 
 // orderedPlacements — размещения по кругу от стартового (см. PlacementStrategy),
@@ -344,13 +353,7 @@ func (g *InstanceGroup) watch(op yandexapi.CreateOperation, p Placement) {
 
 		g.log.Error("instance creation failed after the request was accepted", "id", op.InstanceID(), "zone", p.Zone, "platform_id", p.PlatformID, "error", err)
 
-		if placementFailure(err) {
-			g.mu.Lock()
-			g.exhaustedUntil[p] = g.now().Add(placementCooldown)
-			g.mu.Unlock()
-
-			g.log.Warn("placement moved to the end of the list", "zone", p.Zone, "platform_id", p.PlatformID, "for", placementCooldown)
-		}
+		g.deferPlacement(p)
 	}()
 }
 

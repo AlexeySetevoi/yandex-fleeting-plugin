@@ -327,7 +327,9 @@ func TestIncreasePlacementFallback(t *testing.T) {
 	}
 }
 
-func TestIncreaseNoFallbackOnOtherErrors(t *testing.T) {
+// Ошибка, которая есть во всех размещениях (права, образ), перепробуется везде
+// и вернётся раннеру со всеми зонами.
+func TestIncreaseErrorInAllPlacements(t *testing.T) {
 	fake := &fakeCompute{create: func(yandexapi.CreateInstanceRequest) error {
 		return errors.New("permission denied")
 	}}
@@ -344,8 +346,39 @@ func TestIncreaseNoFallbackOnOtherErrors(t *testing.T) {
 	if err == nil || succeeded != 0 {
 		t.Fatalf("Increase() = %d, %v, want an error", succeeded, err)
 	}
-	if len(fake.created) != 1 {
-		t.Fatalf("create attempts = %d, want 1", len(fake.created))
+	if len(fake.created) != 2 {
+		t.Fatalf("create attempts = %d, want 2", len(fake.created))
+	}
+	for _, zone := range []string{"ru-central1-a", "ru-central1-b"} {
+		if !strings.Contains(err.Error(), zone) {
+			t.Fatalf("error %q does not mention %s", err, zone)
+		}
+	}
+}
+
+// Закрытая зона отвечает FailedPrecondition "Zone is down" — тоже повод идти дальше.
+func TestIncreaseFallbackOnZoneDown(t *testing.T) {
+	fake := &fakeCompute{create: func(req yandexapi.CreateInstanceRequest) error {
+		if req.Zone == "ru-central1-a" {
+			return errors.New("rpc error: code = FailedPrecondition desc = Zone is down")
+		}
+		return nil
+	}}
+	g := asyncPlacementsGroup()
+	initGroup(t, g, fake, provider.Settings{})
+
+	if succeeded, err := g.Increase(context.Background(), 1); err != nil || succeeded != 1 {
+		t.Fatalf("Increase() = %d, %v", succeeded, err)
+	}
+	if got := fake.created[len(fake.created)-1].Zone; got != "ru-central1-b" {
+		t.Fatalf("instance went to %s, want ru-central1-b", got)
+	}
+	// отказавшая зона в конце очереди: следующий запрос сразу во вторую
+	if succeeded, err := g.Increase(context.Background(), 1); err != nil || succeeded != 1 {
+		t.Fatalf("Increase() = %d, %v", succeeded, err)
+	}
+	if n := len(fake.created); n != 3 || fake.created[2].Zone != "ru-central1-b" {
+		t.Fatalf("attempts = %+v, want the second request to go straight to ru-central1-b", fake.created)
 	}
 }
 
@@ -701,8 +734,8 @@ func TestAsyncExhaustionMovesPlacementToTheEnd(t *testing.T) {
 	}
 }
 
-// Любая другая ошибка операции от смены зоны не лечится: порядок не меняется.
-func TestAsyncOtherErrorKeepsPlacementOrder(t *testing.T) {
+// Любая упавшая операция отправляет размещение в конец очереди.
+func TestAsyncAnyErrorMovesPlacementToTheEnd(t *testing.T) {
 	fake := &fakeCompute{opErr: func(yandexapi.CreateInstanceRequest) error {
 		return errors.New("internal error")
 	}}
@@ -716,10 +749,8 @@ func TestAsyncOtherErrorKeepsPlacementOrder(t *testing.T) {
 		g.watchers.Wait()
 	}
 
-	for i, req := range fake.created {
-		if req.Zone != "ru-central1-a" {
-			t.Fatalf("request #%d went to %s, want the first placement", i+1, req.Zone)
-		}
+	if fake.created[0].Zone != "ru-central1-a" || fake.created[1].Zone != "ru-central1-b" {
+		t.Fatalf("zones = %s, %s, want the failed placement moved to the end", fake.created[0].Zone, fake.created[1].Zone)
 	}
 }
 
