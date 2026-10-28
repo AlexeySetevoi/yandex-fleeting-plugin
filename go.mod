@@ -5,12 +5,12 @@ go 1.26.10
 require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/hashicorp/go-hclog v1.6.3
-	github.com/yandex-cloud/go-genproto v0.122.0
-	github.com/yandex-cloud/go-sdk/services/compute v1.0.103
-	github.com/yandex-cloud/go-sdk/v2 v2.177.0
+	github.com/yandex-cloud/go-genproto v0.131.0
+	github.com/yandex-cloud/go-sdk/services/compute v1.0.108
+	github.com/yandex-cloud/go-sdk/v2 v2.181.0
 	gitlab.com/gitlab-org/fleeting/fleeting v0.0.0-20260728133024-9832b1044ee2
-	golang.org/x/crypto v0.57.0
-	golang.org/x/sync v0.23.0
+	golang.org/x/crypto v0.58.0
+	golang.org/x/sync v0.24.0
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.12
 )
@@ -49,8 +49,8 @@ require (
 	go.uber.org/zap v1.27.0 // indirect
 	golang.org/x/mod v0.41.0 // indirect
 	golang.org/x/net v0.60.0 // indirect
-	golang.org/x/sys v0.48.0 // indirect
-	golang.org/x/text v0.42.0 // indirect
+	golang.org/x/sys v0.49.0 // indirect
+	golang.org/x/text v0.43.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260706201446-f0a921348800 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260706201446-f0a921348800 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
