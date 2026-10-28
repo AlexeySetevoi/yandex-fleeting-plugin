@@ -17,9 +17,9 @@ func TestMapStatus(t *testing.T) {
 		"UPDATING":     provider.StateRunning,
 		"STOPPING":     provider.StateDeleting,
 		"DELETING":     provider.StateDeleting,
-		"STOPPED":      provider.StateTimeout,
-		"CRASHED":      provider.StateTimeout,
-		"ERROR":        provider.StateTimeout,
+		"STOPPED":      provider.StateDeleting,
+		"CRASHED":      provider.StateDeleting,
+		"ERROR":        provider.StateDeleting,
 	}
 
 	for status, want := range tests {
@@ -34,7 +34,7 @@ func TestMapStatus(t *testing.T) {
 	}
 }
 
-// Новый статус в API должен попасться здесь, а не молча пропускаться в Update.
+// Новый статус в API должен попасться здесь, а не держаться в Update как creating.
 func TestMapStatusCoversAPIEnum(t *testing.T) {
 	for value, name := range compute.Instance_Status_name {
 		if value == int32(compute.Instance_STATUS_UNSPECIFIED) {
@@ -42,6 +42,28 @@ func TestMapStatusCoversAPIEnum(t *testing.T) {
 		}
 		if _, ok := MapStatus(name); !ok {
 			t.Errorf("instance status %s is not mapped", name)
+		}
+	}
+}
+
+// timeout taskscaler забывает без Decrease — его не отдаём ни для какого статуса.
+func TestMapStatusNeverTimeout(t *testing.T) {
+	for _, name := range compute.Instance_Status_name {
+		if state, _ := MapStatus(name); state == provider.StateTimeout {
+			t.Errorf("MapStatus(%s) = timeout", name)
+		}
+	}
+}
+
+func TestBroken(t *testing.T) {
+	for _, status := range []string{"STOPPED", "CRASHED", "ERROR"} {
+		if !Broken(status) {
+			t.Errorf("Broken(%s) = false", status)
+		}
+	}
+	for _, status := range []string{"RUNNING", "PROVISIONING", "STOPPING", "DELETING", "STATUS_UNSPECIFIED"} {
+		if Broken(status) {
+			t.Errorf("Broken(%s) = true", status)
 		}
 	}
 }

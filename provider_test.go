@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -204,7 +205,10 @@ func TestUpdateFiltersByLabel(t *testing.T) {
 	want := map[string]provider.State{
 		"a": provider.StateRunning,
 		"b": provider.StateCreating,
-		"f": provider.StateTimeout,
+		// незнакомый статус остаётся в учёте
+		"e": provider.StateCreating,
+		// сломанную удаляем сами
+		"f": provider.StateDeleting,
 	}
 	if len(got) != len(want) {
 		t.Fatalf("Update() reported %v, want %v", got, want)
@@ -213,6 +217,64 @@ func TestUpdateFiltersByLabel(t *testing.T) {
 		if got[id] != state {
 			t.Fatalf("Update() state[%s] = %q, want %q", id, got[id], state)
 		}
+	}
+	if len(fake.deleted) != 1 || fake.deleted[0] != "f" {
+		t.Fatalf("deleted = %v, want [f]", fake.deleted)
+	}
+}
+
+// Сломанную ВМ Update удаляет сам и повторяет не чаще brokenDeleteRetry,
+// пока облако её не уберёт; ошибка удаления Update не валит.
+func TestUpdateDeletesBrokenInstances(t *testing.T) {
+	now := time.Date(2026, 10, 28, 12, 0, 0, 0, time.UTC)
+	fake := &fakeCompute{
+		instances: []yandexapi.Instance{
+			{ID: "stopped", Status: yandexapi.StatusStopped, Labels: map[string]string{labelGroup: "runner"}},
+			{ID: "fail", Status: yandexapi.StatusCrashed, Labels: map[string]string{labelGroup: "runner"}},
+			{ID: "ok", Status: yandexapi.StatusRunning, Labels: map[string]string{labelGroup: "runner"}},
+		},
+		deleteErr: map[string]error{"fail": errors.New("too many active operations")},
+	}
+
+	g := validGroup()
+	g.now = func() time.Time { return now }
+	initGroup(t, g, fake, provider.Settings{})
+
+	update := func() map[string]provider.State {
+		t.Helper()
+		got := map[string]provider.State{}
+		if err := g.Update(context.Background(), func(id string, state provider.State) { got[id] = state }); err != nil {
+			t.Fatalf("Update() = %v", err)
+		}
+		return got
+	}
+
+	got := update()
+	if got["stopped"] != provider.StateDeleting || got["fail"] != provider.StateDeleting || got["ok"] != provider.StateRunning {
+		t.Fatalf("Update() = %v", got)
+	}
+	if !slices.Equal(fake.deleted, []string{"stopped"}) {
+		t.Fatalf("deleted = %v, want [stopped]", fake.deleted)
+	}
+
+	now = now.Add(brokenDeleteRetry / 2)
+	update()
+	if len(fake.deleted) != 1 {
+		t.Fatalf("deleted again before retry interval: %v", fake.deleted)
+	}
+
+	delete(fake.deleteErr, "fail")
+	now = now.Add(brokenDeleteRetry)
+	update()
+	if !slices.Equal(fake.deleted, []string{"stopped", "stopped", "fail"}) {
+		t.Fatalf("deleted = %v, want [stopped stopped fail]", fake.deleted)
+	}
+
+	// ВМ ушли — учёт по ним забыт
+	fake.instances = fake.instances[2:]
+	update()
+	if len(g.brokenDeletes) != 0 {
+		t.Fatalf("brokenDeletes = %v, want empty", g.brokenDeletes)
 	}
 }
 

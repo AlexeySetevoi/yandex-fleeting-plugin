@@ -27,6 +27,9 @@ const (
 
 	// на сколько размещение уходит в конец очереди после отказа
 	placementCooldown = 10 * time.Minute
+
+	// как часто Update повторяет удаление сломанной ВМ
+	brokenDeleteRetry = time.Minute
 )
 
 // Порядок, в котором пробуются размещения для нового инстанса.
@@ -126,6 +129,11 @@ type InstanceGroup struct {
 	exhaustedUntil map[Placement]time.Time
 	// следующее стартовое размещение для round_robin
 	nextPlacement int
+
+	// brokenDeletes — когда Update последний раз удалял сломанную ВМ,
+	// warned — последний залогированный незнакомый статус; ключ — id инстанса
+	brokenDeletes map[string]time.Time
+	warned        map[string]string
 }
 
 var _ provider.InstanceGroup = (*InstanceGroup)(nil)
@@ -169,28 +177,98 @@ func (g *InstanceGroup) Init(ctx context.Context, log hclog.Logger, settings pro
 	}, nil
 }
 
+// Update отдаёт все ВМ группы.
+//
+// Инстанс в timeout или не возвращённый Update 5 циклов подряд taskscaler
+// забывает без Decrease, и ВМ остаётся в каталоге навсегда. Поэтому сломанные
+// ВМ удаляем здесь сами, а незнакомый статус не пропускаем.
 func (g *InstanceGroup) Update(ctx context.Context, update func(instance string, state provider.State)) error {
 	instances, err := g.client.ListInstances(ctx, g.FolderID)
 	if err != nil {
 		return fmt.Errorf("could not list instances: %w", err)
 	}
 
+	seen := make(map[string]struct{}, len(instances))
 	for _, instance := range instances {
 		if instance.Labels[labelGroup] != g.Name {
 			continue
 		}
+		seen[instance.ID] = struct{}{}
+
+		if Broken(instance.Status) {
+			g.deleteBroken(ctx, instance)
+		}
 
 		state, ok := MapStatus(instance.Status)
 		if !ok {
-			g.log.Warn("unrecognized instance status, skipping", "id", instance.ID, "status", instance.Status)
-			continue
+			// держим в учёте, пока статус не прояснится
+			g.warnUnrecognized(instance.ID, instance.Status)
+			state = provider.StateCreating
 		}
 		g.log.Debug("instance status", "id", instance.ID, "status", instance.Status, "state", state)
 
 		update(instance.ID, state)
 	}
+	g.forgetUnseen(seen)
 
 	return nil
+}
+
+// deleteBroken удаляет ВМ, которая сама не вернётся, не чаще раза в
+// brokenDeleteRetry: пока облако её не убрало, Update видит её снова. Ошибка
+// только в лог — повторим на следующем цикле (например, при упоре в лимит
+// активных операций).
+func (g *InstanceGroup) deleteBroken(ctx context.Context, instance yandexapi.Instance) {
+	now := g.now()
+
+	g.mu.Lock()
+	if at, ok := g.brokenDeletes[instance.ID]; ok && now.Sub(at) < brokenDeleteRetry {
+		g.mu.Unlock()
+		return
+	}
+	if g.brokenDeletes == nil {
+		g.brokenDeletes = map[string]time.Time{}
+	}
+	g.brokenDeletes[instance.ID] = now
+	g.mu.Unlock()
+
+	g.log.Warn("instance is broken, deleting", "id", instance.ID, "instance_name", instance.Name, "status", instance.Status)
+
+	if err := g.client.DeleteInstance(ctx, instance.ID); err != nil && !errors.Is(err, yandexapi.ErrNotFound) {
+		g.log.Error("could not delete broken instance", "id", instance.ID, "error", err)
+	}
+}
+
+func (g *InstanceGroup) warnUnrecognized(id, status string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.warned[id] == status {
+		return
+	}
+	if g.warned == nil {
+		g.warned = map[string]string{}
+	}
+	g.warned[id] = status
+
+	g.log.Warn("unrecognized instance status, reporting as creating", "id", id, "status", status)
+}
+
+// forgetUnseen чистит учёт по ВМ, которых в каталоге больше нет.
+func (g *InstanceGroup) forgetUnseen(seen map[string]struct{}) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	for id := range g.brokenDeletes {
+		if _, ok := seen[id]; !ok {
+			delete(g.brokenDeletes, id)
+		}
+	}
+	for id := range g.warned {
+		if _, ok := seen[id]; !ok {
+			delete(g.warned, id)
+		}
+	}
 }
 
 // Increase возвращается, как только облако приняло запросы: инстанс с этого
