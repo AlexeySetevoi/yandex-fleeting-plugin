@@ -1,6 +1,6 @@
 module github.com/AlexeySetevoi/yandex-fleeting-plugin
 
-go 1.26.8
+go 1.26.10
 
 require (
 	github.com/BurntSushi/toml v1.6.0
@@ -48,7 +48,7 @@ require (
 	go.uber.org/multierr v1.10.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect
 	golang.org/x/mod v0.41.0 // indirect
-	golang.org/x/net v0.59.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260706201446-f0a921348800 // indirect
