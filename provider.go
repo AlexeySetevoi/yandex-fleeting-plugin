@@ -30,6 +30,11 @@ const (
 
 	// как часто Update повторяет удаление сломанной ВМ
 	brokenDeleteRetry = time.Minute
+
+	// пауза после отказа всех размещений, удваивается до backoffMax;
+	// backoffMax же — сколько ждём исхода пробного инстанса
+	backoffMin = 10 * time.Second
+	backoffMax = 5 * time.Minute
 )
 
 // Порядок, в котором пробуются размещения для нового инстанса.
@@ -134,6 +139,15 @@ type InstanceGroup struct {
 	// warned — последний залогированный незнакомый статус; ключ — id инстанса
 	brokenDeletes map[string]time.Time
 	warned        map[string]string
+
+	// Бэкоф: fleeting повторяет Increase каждые 2 с без паузы, и без неё
+	// каждая попытка — инстанс и диск, которые тут же откатываются.
+	// failures — отказы подряд, до retryAt в облако не ходим; пока не истёк
+	// probeUntil, ждём исхода пробного инстанса; lastErr — для ответа раннеру.
+	failures   int
+	retryAt    time.Time
+	probeUntil time.Time
+	lastErr    error
 }
 
 var _ provider.InstanceGroup = (*InstanceGroup)(nil)
@@ -274,8 +288,14 @@ func (g *InstanceGroup) forgetUnseen(seen map[string]struct{}) {
 // Increase возвращается, как только облако приняло запросы: инстанс с этого
 // момента виден в Update как creating. Ошибки квоты, прав и конфигурации
 // приходят сразу и попадают в ответ; то, что выясняется позже (нехватка
-// ресурсов зоны), ловит watch.
+// ресурсов зоны), ловит watch. Если отказали все запросы, следующие ждут
+// паузы (см. admit).
 func (g *InstanceGroup) Increase(ctx context.Context, delta int) (int, error) {
+	delta, err := g.admit(delta)
+	if delta == 0 {
+		return 0, err
+	}
+
 	var (
 		mu        sync.Mutex
 		errs      []error
@@ -305,7 +325,74 @@ func (g *InstanceGroup) Increase(ctx context.Context, delta int) (int, error) {
 	}
 	_ = eg.Wait()
 
-	return succeeded, errors.Join(errs...)
+	err = errors.Join(errs...)
+	// отменённый запрос раннера — не отказ облака
+	if succeeded == 0 && ctx.Err() == nil {
+		g.fail(err)
+	}
+
+	return succeeded, err
+}
+
+// admit решает, сколько инстансов можно запросить сейчас: во время паузы —
+// ни одного, после неё — один пробный, пока какой-нибудь инстанс не поднимется.
+func (g *InstanceGroup) admit(delta int) (int, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.failures == 0 {
+		return delta, nil
+	}
+
+	now := g.now()
+	if now.Before(g.retryAt) {
+		return 0, fmt.Errorf("backing off after %d failed attempts, next attempt in %s: %w",
+			g.failures, g.retryAt.Sub(now).Round(time.Second), g.lastErr)
+	}
+	if now.Before(g.probeUntil) {
+		return 0, nil
+	}
+
+	g.probeUntil = now.Add(backoffMax)
+	g.log.Info("requesting a probe instance after failures", "failures", g.failures)
+	return 1, nil
+}
+
+// fail считает отказ и откладывает следующую попытку. Отказы внутри уже идущей
+// паузы не считаются: пачка инстансов, упавших разом, — один отказ.
+func (g *InstanceGroup) fail(err error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	now := g.now()
+	if now.Before(g.retryAt) {
+		return
+	}
+
+	g.failures++
+	delay := backoffMax
+	if shift := g.failures - 1; shift < 16 {
+		delay = min(backoffMin<<shift, backoffMax)
+	}
+	g.retryAt = now.Add(delay)
+	g.probeUntil = time.Time{}
+	g.lastErr = err
+
+	g.log.Warn("instance creation failed, backing off", "failures", g.failures, "for", delay, "error", err)
+}
+
+// succeed снимает бэкоф: инстанс поднялся, облако снова выдаёт машины.
+func (g *InstanceGroup) succeed() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.failures > 0 {
+		g.log.Info("instance created, backoff reset", "failures", g.failures)
+	}
+	g.failures = 0
+	g.retryAt = time.Time{}
+	g.probeUntil = time.Time{}
+	g.lastErr = nil
 }
 
 // createInstance перебирает варианты размещения по порядку и переходит к
@@ -413,7 +500,7 @@ func (g *InstanceGroup) orderedPlacements() []Placement {
 
 // watch дожидается операции создания в фоне. Упавшую операцию облако
 // откатывает само: инстанс пропадает из списка, и раннер запрашивает замену —
-// к тому моменту размещение уже в конце очереди.
+// к тому моменту размещение уже в конце очереди, а Increase на паузе (см. fail).
 func (g *InstanceGroup) watch(op yandexapi.CreateOperation, p Placement) {
 	g.watchers.Add(1)
 
@@ -423,6 +510,7 @@ func (g *InstanceGroup) watch(op yandexapi.CreateOperation, p Placement) {
 		instance, err := op.Wait(g.watchCtx)
 		if err == nil {
 			g.log.Info("instance created", "id", instance.ID, "instance_name", instance.Name)
+			g.succeed()
 			return
 		}
 		if g.watchCtx.Err() != nil {
@@ -432,6 +520,7 @@ func (g *InstanceGroup) watch(op yandexapi.CreateOperation, p Placement) {
 		g.log.Error("instance creation failed after the request was accepted", "id", op.InstanceID(), "zone", p.Zone, "platform_id", p.PlatformID, "error", err)
 
 		g.deferPlacement(p)
+		g.fail(fmt.Errorf("zone %s platform %s: %w", p.Zone, p.PlatformID, err))
 	}()
 }
 

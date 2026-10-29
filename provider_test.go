@@ -774,6 +774,7 @@ func TestAsyncExhaustionMovesPlacementToTheEnd(t *testing.T) {
 			t.Fatalf("Increase() = %d, %v", succeeded, err)
 		}
 		g.watchers.Wait()
+		skipBackoff(g)
 		return fake.created[len(fake.created)-1].Zone
 	}
 
@@ -809,6 +810,7 @@ func TestAsyncAnyErrorMovesPlacementToTheEnd(t *testing.T) {
 			t.Fatalf("Increase() = %d, %v", succeeded, err)
 		}
 		g.watchers.Wait()
+		skipBackoff(g)
 	}
 
 	if fake.created[0].Zone != "ru-central1-a" || fake.created[1].Zone != "ru-central1-b" {
@@ -831,6 +833,7 @@ func TestAllPlacementsExhaustedAreStillTried(t *testing.T) {
 			t.Fatalf("Increase() = %d, %v", succeeded, err)
 		}
 		g.watchers.Wait()
+		skipBackoff(g)
 		zones = append(zones, fake.created[len(fake.created)-1].Zone)
 	}
 
@@ -915,6 +918,7 @@ func TestAsyncUnavailableMovesPlacementToTheEnd(t *testing.T) {
 			t.Fatalf("Increase() = %d, %v", succeeded, err)
 		}
 		g.watchers.Wait()
+		skipBackoff(g)
 	}
 	if zone := fake.created[1].Zone; zone != "ru-central1-b" {
 		t.Fatalf("request after the async failure went to %s, want ru-central1-b", zone)
@@ -965,5 +969,219 @@ func TestShutdownDoesNotWaitForOperations(t *testing.T) {
 	// отменённое ожидание — не отказ зоны
 	if got := g.orderedPlacements(); len(got) != 1 || len(g.exhaustedUntil) != 0 {
 		t.Fatalf("placements after shutdown = %v, exhausted = %v", got, g.exhaustedUntil)
+	}
+}
+
+// skipBackoff — для тестов порядка размещений, где пауза после отказа мешает.
+func skipBackoff(g *InstanceGroup) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.failures = 0
+	g.retryAt = time.Time{}
+	g.probeUntil = time.Time{}
+}
+
+// Отказали все размещения — до конца паузы в облако не ходим, после неё
+// шлём один пробный инстанс, а не всю пачку.
+func TestBackoffAfterAllPlacementsFail(t *testing.T) {
+	fake := &fakeCompute{}
+	fake.create = func(yandexapi.CreateInstanceRequest) error {
+		return fmt.Errorf("%w: quota exceeded", yandexapi.ErrResourceExhausted)
+	}
+
+	now := time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC)
+	g := asyncPlacementsGroup()
+	g.now = func() time.Time { return now }
+	initGroup(t, g, fake, provider.Settings{})
+
+	if succeeded, err := g.Increase(context.Background(), 5); succeeded != 0 || err == nil {
+		t.Fatalf("Increase() = %d, %v, want an error", succeeded, err)
+	}
+	attempts := len(fake.created)
+
+	now = now.Add(backoffMin - time.Second)
+	succeeded, err := g.Increase(context.Background(), 5)
+	if succeeded != 0 || !errors.Is(err, yandexapi.ErrResourceExhausted) {
+		t.Fatalf("Increase() during backoff = %d, %v, want the last error", succeeded, err)
+	}
+	if len(fake.created) != attempts {
+		t.Fatalf("create attempts during backoff = %d, want none", len(fake.created)-attempts)
+	}
+
+	now = now.Add(2 * time.Second)
+	if succeeded, err := g.Increase(context.Background(), 5); succeeded != 0 || err == nil {
+		t.Fatalf("Increase() = %d, %v, want an error", succeeded, err)
+	}
+	// один инстанс по всем размещениям
+	if got := len(fake.created) - attempts; got != len(g.placements) {
+		t.Fatalf("create attempts after backoff = %d, want %d", got, len(g.placements))
+	}
+}
+
+// Пауза удваивается с каждым отказом и упирается в backoffMax.
+func TestBackoffGrowsAndIsCapped(t *testing.T) {
+	fake := &fakeCompute{}
+	fake.create = func(yandexapi.CreateInstanceRequest) error {
+		return errors.New("forbidden")
+	}
+
+	now := time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC)
+	g := validGroup()
+	g.now = func() time.Time { return now }
+	initGroup(t, g, fake, provider.Settings{})
+
+	var delays []time.Duration
+	for range 8 {
+		if succeeded, err := g.Increase(context.Background(), 1); succeeded != 0 || err == nil {
+			t.Fatalf("Increase() = %d, %v, want an error", succeeded, err)
+		}
+		delays = append(delays, g.retryAt.Sub(now))
+		now = g.retryAt
+	}
+
+	want := []time.Duration{10 * time.Second, 20 * time.Second, 40 * time.Second, 80 * time.Second,
+		160 * time.Second, backoffMax, backoffMax, backoffMax}
+	if !slices.Equal(delays, want) {
+		t.Fatalf("delays = %v, want %v", delays, want)
+	}
+}
+
+// Пачка инстансов, разом упавших в операции, — один отказ, а не N.
+func TestBackoffCountsAsyncBatchOnce(t *testing.T) {
+	fake := &fakeCompute{}
+	fake.hold = make(chan struct{})
+	fake.opErr = func(yandexapi.CreateInstanceRequest) error {
+		return fmt.Errorf("%w: not enough resources in zone", yandexapi.ErrResourceExhausted)
+	}
+
+	now := time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC)
+	g := validGroup()
+	g.now = func() time.Time { return now }
+	initGroup(t, g, fake, provider.Settings{})
+
+	if succeeded, err := g.Increase(context.Background(), 5); err != nil || succeeded != 5 {
+		t.Fatalf("Increase() = %d, %v", succeeded, err)
+	}
+	close(fake.hold)
+	g.watchers.Wait()
+
+	if g.failures != 1 || !g.retryAt.Equal(now.Add(backoffMin)) {
+		t.Fatalf("failures = %d, retry in %s, want 1 and %s", g.failures, g.retryAt.Sub(now), backoffMin)
+	}
+	if succeeded, err := g.Increase(context.Background(), 1); succeeded != 0 || err == nil {
+		t.Fatalf("Increase() = %d, %v, want backoff", succeeded, err)
+	}
+}
+
+// Пока пробный инстанс создаётся, новых не просим; поднялся — снова полная
+// скорость.
+func TestBackoffProbeAndReset(t *testing.T) {
+	fail := true
+	fake := &fakeCompute{}
+	fake.create = func(yandexapi.CreateInstanceRequest) error {
+		if fail {
+			return fmt.Errorf("%w: quota exceeded", yandexapi.ErrResourceExhausted)
+		}
+		return nil
+	}
+
+	now := time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC)
+	g := validGroup()
+	g.now = func() time.Time { return now }
+	initGroup(t, g, fake, provider.Settings{})
+
+	if succeeded, _ := g.Increase(context.Background(), 3); succeeded != 0 {
+		t.Fatalf("Increase() = %d, want 0", succeeded)
+	}
+
+	fail = false
+	fake.hold = make(chan struct{})
+	now = now.Add(backoffMin)
+	if succeeded, err := g.Increase(context.Background(), 3); err != nil || succeeded != 1 {
+		t.Fatalf("probe Increase() = %d, %v, want 1", succeeded, err)
+	}
+	if succeeded, err := g.Increase(context.Background(), 3); err != nil || succeeded != 0 {
+		t.Fatalf("Increase() while probing = %d, %v, want 0 and no error", succeeded, err)
+	}
+
+	close(fake.hold)
+	g.watchers.Wait()
+
+	before := len(fake.created)
+	if succeeded, err := g.Increase(context.Background(), 3); err != nil || succeeded != 3 {
+		t.Fatalf("Increase() after the probe came up = %d, %v, want 3", succeeded, err)
+	}
+	if got := len(fake.created) - before; got != 3 {
+		t.Fatalf("create attempts = %d, want 3", got)
+	}
+}
+
+// Застрявший пробный инстанс не держит группу вечно: через backoffMax — новый.
+func TestBackoffProbeTimeout(t *testing.T) {
+	fail := true
+	fake := &fakeCompute{}
+	fake.hold = make(chan struct{})
+	defer close(fake.hold)
+	fake.create = func(yandexapi.CreateInstanceRequest) error {
+		if fail {
+			return errors.New("forbidden")
+		}
+		return nil
+	}
+
+	now := time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC)
+	g := validGroup()
+	g.now = func() time.Time { return now }
+	initGroup(t, g, fake, provider.Settings{})
+
+	_, _ = g.Increase(context.Background(), 1)
+	fail = false
+	now = now.Add(backoffMin)
+	if succeeded, _ := g.Increase(context.Background(), 1); succeeded != 1 {
+		t.Fatalf("probe Increase() = %d, want 1", succeeded)
+	}
+
+	now = now.Add(backoffMax - time.Second)
+	if succeeded, _ := g.Increase(context.Background(), 1); succeeded != 0 {
+		t.Fatalf("Increase() while probing = %d, want 0", succeeded)
+	}
+	now = now.Add(time.Second)
+	if succeeded, _ := g.Increase(context.Background(), 1); succeeded != 1 {
+		t.Fatalf("Increase() after the probe timeout = %d, want a new probe", succeeded)
+	}
+}
+
+// Частичный успех и отменённый запрос раннера паузу не включают.
+func TestBackoffNotOnPartialSuccessOrCancel(t *testing.T) {
+	var calls int
+	fake := &fakeCompute{}
+	fake.create = func(yandexapi.CreateInstanceRequest) error {
+		calls++
+		if calls%2 == 0 {
+			return fmt.Errorf("%w: quota", yandexapi.ErrResourceExhausted)
+		}
+		return nil
+	}
+	g := validGroup()
+	initGroup(t, g, fake, provider.Settings{})
+
+	if succeeded, _ := g.Increase(context.Background(), 4); succeeded != 2 {
+		t.Fatalf("Increase() = %d, want 2", succeeded)
+	}
+	g.watchers.Wait()
+	if g.failures != 0 {
+		t.Fatalf("failures after partial success = %d, want 0", g.failures)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	fake.create = func(yandexapi.CreateInstanceRequest) error {
+		cancel()
+		return context.Canceled
+	}
+	if succeeded, _ := g.Increase(ctx, 1); succeeded != 0 {
+		t.Fatalf("Increase() = %d, want 0", succeeded)
+	}
+	if g.failures != 0 {
+		t.Fatalf("failures after a cancelled request = %d, want 0", g.failures)
 	}
 }
